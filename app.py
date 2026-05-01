@@ -26,21 +26,26 @@ def send_telegram(status: dict):
     d     = status["direction"]
     pair  = status["pair"]
     price = status["price"]
-    side  = "below" if d == "LONG" else "above"
-    curve = "up" if d == "LONG" else "down"
-    tag   = "[LONG]" if d == "LONG" else "[SHORT]"
+    score = status["confluence_score"]
+    tag   = "🟢 LONG" if d == "LONG" else "🔴 SHORT"
 
-    msg = (
-        f"{tag} <b>{pair}</b> - EMA Aligned\n"
-        f"Price: <b>{price}</b>\n\n"
-        f"EMA 50 on all 4 timeframes:\n"
-        f"  Daily  : {side}\n"
-        f"  4H     : {side} + curving {curve}\n"
-        f"  2H     : {side} + curving {curve}\n"
-        f"  1H     : {side}\n\n"
-        f"Go check your fib zone on the chart.\n"
-        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-    )
+    lines = [
+        f"{tag} — <b>{pair}</b>",
+        f"Price: <b>{price}</b>   |   Confluences: <b>{score}/4</b>",
+        "",
+    ]
+
+    for item in status.get("confluence_detail", []):
+        tick = "✅" if any(kw in item for kw in ("AT ZONE", "agree", "CONFIRMED", "below", "above")) else "⬜"
+        lines.append(f"{tick} {item}")
+
+    lines += [
+        "",
+        "👉 Check your fib zone on the chart.",
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    ]
+
+    msg = "\n".join(lines)
 
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
