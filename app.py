@@ -69,17 +69,12 @@ def scheduled_scan():
         logger.exception(f"Scan error: {e}")
 
 
-# Start scheduler — first scan after 2 minutes, then every 15 minutes
+# Two daily scans: 07:00 UTC (pre-London) and 12:30 UTC (pre-New York)
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(
-    scheduled_scan,
-    "interval",
-    minutes=15,
-    id="zscn_scan",
-    next_run_time=datetime.now(timezone.utc) + timedelta(minutes=2)
-)
+scheduler.add_job(scheduled_scan, "cron", hour=7,  minute=0,  id="pre_london")
+scheduler.add_job(scheduled_scan, "cron", hour=12, minute=30, id="pre_newyork")
 scheduler.start()
-logger.info("Scheduler started - first scan in 2 minutes")
+logger.info("Scheduler started — scans at 07:00 UTC (pre-London) and 12:30 UTC (pre-NY)")
 
 
 @app.route("/")
