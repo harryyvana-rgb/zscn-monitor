@@ -23,24 +23,22 @@ def send_telegram(status: dict):
         logger.warning("Telegram credentials not set")
         return
 
-    d       = status["direction"]
-    arrow   = "LONG" if d == "LONG" else "SHORT"
-    pair    = status["pair"]
-    price   = status["price"]
-    fib_50  = status.get("fib_50", "-")
-    fib_618 = status.get("fib_618", "-")
-    side    = "below" if d == "LONG" else "above"
+    d     = status["direction"]
+    pair  = status["pair"]
+    price = status["price"]
+    side  = "below" if d == "LONG" else "above"
+    curve = "up" if d == "LONG" else "down"
+    tag   = "[LONG]" if d == "LONG" else "[SHORT]"
 
     msg = (
-        f"{'[LONG]' if d == 'LONG' else '[SHORT]'} <b>{pair}</b> - Grade A+\n"
-        f"Price: <b>{price}</b>\n"
-        f"Fib zone: {fib_618} to {fib_50}\n\n"
-        f"EMA 50 Alignment:\n"
-        f"  Daily: {side}\n"
-        f"  4H: {side} + curving {'up' if d == 'LONG' else 'down'}\n"
-        f"  2H: {side} + curving {'up' if d == 'LONG' else 'down'}\n"
-        f"  1H: {side}\n\n"
-        f"Price in golden fib zone - all 4 TF aligned\n"
+        f"{tag} <b>{pair}</b> - EMA Aligned\n"
+        f"Price: <b>{price}</b>\n\n"
+        f"EMA 50 on all 4 timeframes:\n"
+        f"  Daily  : {side}\n"
+        f"  4H     : {side} + curving {curve}\n"
+        f"  2H     : {side} + curving {curve}\n"
+        f"  1H     : {side}\n\n"
+        f"Go check your fib zone on the chart.\n"
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
     )
 
