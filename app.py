@@ -72,9 +72,9 @@ def scheduled_scan():
 
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(scheduled_scan, "interval", minutes=15, id="zscn_scan",
-                  next_run_time=datetime.now(timezone.utc))
+                  next_run_time=datetime.now(timezone.utc) + __import__("datetime").timedelta(seconds=90))
 scheduler.start()
-logger.info("Scheduler started — scanning every 15 minutes")
+logger.info("Scheduler started — first scan in 90 seconds, then every 15 minutes")
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
