@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>ZSCN Monitor</title>
+  <meta http-equiv="refresh" content="60"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', sans-serif; min-height: 100vh; }
+
+    /* ── Header ── */
+    .header {
+      background: #161b22; border-bottom: 1px solid #30363d;
+      padding: 16px 28px; display: flex; align-items: center;
+      justify-content: space-between; position: sticky; top: 0; z-index: 10;
+    }
+    .header h1 { font-size: 18px; font-weight: 700; color: #fff; }
+    .header .sub { font-size: 12px; color: #8b949e; margin-top: 2px; }
+    .last-scan { font-size: 11px; color: #484f58; }
+
+    /* ── Layout ── */
+    .main { display: grid; grid-template-columns: 1fr 340px; gap: 0; min-height: calc(100vh - 57px); }
+    .pairs-panel { padding: 20px; border-right: 1px solid #21262d; }
+    .alerts-panel { padding: 20px; background: #0d1117; }
+    @media (max-width: 900px) {
+      .main { grid-template-columns: 1fr; }
+      .pairs-panel { border-right: none; border-bottom: 1px solid #21262d; }
+    }
+
+    /* ── Section headers ── */
+    .section-title {
+      font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.8px; color: #8b949e; margin-bottom: 14px;
+    }
+
+    /* ── Pair grid ── */
+    .pair-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 10px;
+    }
+    .pair-card {
+      background: #161b22; border: 1px solid #21262d; border-radius: 8px;
+      padding: 12px 14px; transition: border-color .15s;
+    }
+    .pair-card.setup-long  { border-color: #3fb950; background: rgba(63,185,80,.06); }
+    .pair-card.setup-short { border-color: #f85149; background: rgba(248,81,73,.06); }
+    .pair-card.ema-aligned { border-color: #388bfd44; }
+    .pair-name { font-size: 14px; font-weight: 700; color: #fff; margin-bottom: 6px; }
+    .pair-price { font-size: 12px; color: #8b949e; margin-bottom: 8px; }
+
+    .badge {
+      display: inline-block; font-size: 10px; font-weight: 600;
+      padding: 2px 7px; border-radius: 20px; margin-right: 4px; margin-bottom: 4px;
+    }
+    .badge-setup-long  { background: rgba(63,185,80,.15);  color: #3fb950; }
+    .badge-setup-short { background: rgba(248,81,73,.15);  color: #f85149; }
+    .badge-watching    { background: rgba(56,139,253,.12); color: #388bfd; }
+    .badge-none        { background: #21262d; color: #484f58; }
+    .badge-grade       { background: rgba(210,153,34,.15); color: #e3b341; }
+
+    .ema-dots { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
+    .ema-dot {
+      font-size: 10px; padding: 2px 6px; border-radius: 3px;
+      border: 1px solid #30363d; color: #8b949e;
+    }
+    .ema-dot.ok-bull { border-color: #3fb950; color: #3fb950; background: rgba(63,185,80,.07); }
+    .ema-dot.ok-bear { border-color: #f85149; color: #f85149; background: rgba(248,81,73,.07); }
+    .ema-dot.error   { border-color: #484f58; color: #484f58; }
+
+    .pair-error { font-size: 10px; color: #484f58; margin-top: 4px; }
+    .pair-checked { font-size: 10px; color: #30363d; margin-top: 6px; }
+
+    /* ── Alert feed ── */
+    .alert-empty { font-size: 13px; color: #484f58; text-align: center; padding: 40px 0; }
+    .alert-item {
+      background: #161b22; border: 1px solid #21262d; border-radius: 8px;
+      padding: 12px 14px; margin-bottom: 10px;
+    }
+    .alert-item.long  { border-left: 3px solid #3fb950; }
+    .alert-item.short { border-left: 3px solid #f85149; }
+    .alert-top { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+    .alert-pair { font-size: 15px; font-weight: 700; color: #fff; }
+    .alert-dir  { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 20px; }
+    .alert-dir.long  { background: rgba(63,185,80,.15); color: #3fb950; }
+    .alert-dir.short { background: rgba(248,81,73,.15); color: #f85149; }
+    .alert-detail { font-size: 11px; color: #8b949e; margin: 2px 0; }
+    .alert-time   { font-size: 10px; color: #484f58; margin-top: 4px; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1>ZSCN Monitor</h1>
+    <div class="sub">28 pairs · 4-TF EMA · Fib 50-61.8% · Scanning every 15 min</div>
+  </div>
+  <div class="last-scan">Last scan: {{ last_scan }}</div>
+</div>
+
+<div class="main">
+
+  <!-- ── Pair Status Panel ── -->
+  <div class="pairs-panel">
+    <div class="section-title">All Pairs</div>
+    <div class="pair-grid">
+      {% for p in pairs %}
+        {% set dir = p.get('direction', 'NONE') %}
+        {% set card_class = '' %}
+        {% if p.get('setup') and dir == 'LONG' %}{% set card_class = 'setup-long' %}
+        {% elif p.get('setup') and dir == 'SHORT' %}{% set card_class = 'setup-short' %}
+        {% elif p.get('ema_aligned') %}{% set card_class = 'ema-aligned' %}
+        {% endif %}
+
+        <div class="pair-card {{ card_class }}">
+          <div class="pair-name">{{ p['pair'] }}</div>
+          <div class="pair-price">{{ p['price'] or '—' }}</div>
+
+          {% if p.get('setup') %}
+            <span class="badge badge-setup-{{ dir | lower }}">
+              {{ '🟢' if dir == 'LONG' else '🔴' }} {{ dir }}
+            </span>
+            <span class="badge badge-grade">A+</span>
+          {% elif p.get('ema_aligned') %}
+            <span class="badge badge-watching">👀 EMA Aligned</span>
+          {% elif p.get('error') %}
+            <span class="badge badge-none">Error</span>
+          {% else %}
+            <span class="badge badge-none">No Setup</span>
+          {% endif %}
+
+          {% if p.get('price') %}
+            <div class="ema-dots">
+              {% set d_cls = ('ok-bull' if dir == 'LONG' else 'ok-bear') if p.get('ema_aligned') else '' %}
+              <span class="ema-dot {{ d_cls }}">D</span>
+              <span class="ema-dot {{ d_cls }}">4H</span>
+              <span class="ema-dot {{ d_cls }}">2H</span>
+              <span class="ema-dot {{ d_cls }}">1H</span>
+            </div>
+          {% endif %}
+
+          {% if p.get('error') %}
+            <div class="pair-error">{{ p['error'][:40] }}</div>
+          {% endif %}
+          <div class="pair-checked">{{ p.get('last_checked', '') }}</div>
+        </div>
+      {% endfor %}
+
+      {% if not pairs %}
+        <div style="color:#484f58;font-size:13px;padding:20px 0;grid-column:1/-1;">
+          First scan in progress…
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- ── Alerts Panel ── -->
+  <div class="alerts-panel">
+    <div class="section-title">Recent Alerts</div>
+
+    {% if not alerts %}
+      <div class="alert-empty">No alerts yet.<br>Watching for setups…</div>
+    {% endif %}
+
+    {% for a in alerts %}
+      {% set dir = a.get('direction','LONG') %}
+      <div class="alert-item {{ dir | lower }}">
+        <div class="alert-top">
+          <span class="alert-pair">{{ a['pair'] }}</span>
+          <span class="alert-dir {{ dir | lower }}">{{ '🟢' if dir == 'LONG' else '🔴' }} {{ dir }}</span>
+        </div>
+        <div class="alert-detail">💰 {{ a.get('price','—') }}</div>
+        <div class="alert-detail">📍 Fib {{ a.get('fib_618','—') }} – {{ a.get('fib_50','—') }}</div>
+        <div class="alert-time">{{ a.get('received_at','') }}</div>
+      </div>
+    {% endfor %}
+  </div>
+
+</div>
+</body>
+</html>
