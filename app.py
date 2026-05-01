@@ -8,6 +8,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from monitor import run_scan, pair_status, recent_alerts
 
+last_scan_time = None
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -59,8 +61,10 @@ def send_telegram(status: dict):
 
 
 def scheduled_scan():
+    global last_scan_time
     try:
         run_scan(send_telegram)
+        last_scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     except Exception as e:
         logger.exception(f"Scan error: {e}")
 
@@ -97,13 +101,13 @@ def health():
 def dashboard():
     sorted_pairs = sorted(
         pair_status.values(),
-        key=lambda s: (not s.get("setup"), not s.get("ema_aligned"), s["pair"])
+        key=lambda s: (not s.get("alert"), not s.get("ema_aligned"), s["pair"])
     )
     return render_template(
         "dashboard.html",
         pairs=sorted_pairs,
         alerts=recent_alerts,
-        last_scan=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        last_scan=last_scan_time or "Waiting for first scan…"
     )
 
 
