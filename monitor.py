@@ -285,7 +285,7 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
 
         status["confluence_score"]  = score
         status["confluence_detail"] = detail
-        status["alert"] = score >= 3   # alert when 3+ confluences stack
+        status["alert"] = score >= 4   # only alert on 4/4 confluences
 
     except Exception as exc:
         logger.exception(f"[{name}] Error: {exc}")
