@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, render_template, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from monitor import run_scan, pair_status, recent_alerts
+from monitor import run_scan, run_weekly_bias, pair_status, recent_alerts
 
 last_scan_time = None
 
@@ -20,11 +20,21 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
-def send_telegram(status: dict):
+def _tg_post(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         logger.warning("Telegram credentials not set")
         return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT, "text": msg, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.error(f"Telegram error: {e}")
 
+
+def send_telegram(status: dict):
     d     = status["direction"]
     pair  = status["pair"]
     price = status["price"]
@@ -38,8 +48,35 @@ def send_telegram(status: dict):
     ]
 
     for item in status.get("confluence_detail", []):
-        tick = "✅" if any(kw in item for kw in ("AT ZONE", "agree", "CONFIRMED", "below", "above")) else "⬜"
+        if any(kw in item for kw in ("AT ZONE", "agree", "CONFIRMED")):
+            tick = "✅"
+        elif "BONUS" in item:
+            tick = "⭐"
+        else:
+            tick = "✅"
         lines.append(f"{tick} {item}")
+
+    # S/R map
+    above = status.get("sr_above", [])
+    below = status.get("sr_below", [])
+    pdh   = status.get("pdh")
+    pdl   = status.get("pdl")
+
+    lines.append("")
+    lines.append("📊 <b>Key Levels</b>")
+
+    if pdh:
+        lines.append(f"  PDH: {pdh}")
+    if pdl:
+        lines.append(f"  PDL: {pdl}")
+
+    if above:
+        lines.append(f"  Resistance above: {' | '.join(str(l) for l in above)}")
+    if below:
+        lines.append(f"  Support below:    {' | '.join(str(l) for l in below)}")
+
+    if status.get("at_trendline"):
+        lines.append(f"  ⭐ Trend line at: {status['trendline_val']}")
 
     lines += [
         "",
@@ -47,17 +84,48 @@ def send_telegram(status: dict):
         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     ]
 
-    msg = "\n".join(lines)
+    _tg_post("\n".join(lines))
 
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT,
-            "text": msg,
-            "parse_mode": "HTML"
-        }, timeout=10)
-    except Exception as e:
-        logger.error(f"Telegram error: {e}")
+
+def send_weekly_bias(ready: list, watch: list, early: list):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    lines = [
+        f"📅 <b>ZSCN Weekly Bias — {now}</b>",
+        "",
+    ]
+
+    if ready:
+        lines.append("🔥 <b>READY TO ENTER (4/4)</b>")
+        for s in ready:
+            tag = "🟢" if s["direction"] == "LONG" else "🔴"
+            lines.append(f"  {tag} {s['pair']} @ {s['price']}")
+        lines.append("")
+
+    if watch:
+        lines.append("👀 <b>WATCH THIS WEEK (EMA + Trend aligned)</b>")
+        for s in watch:
+            tag   = "🟢" if s["direction"] == "LONG" else "🔴"
+            score = s.get("confluence_score", 0)
+            dist  = s.get("sr_dist_pct")
+            dist_str = f" — {dist}% from S/R" if dist else ""
+            lines.append(f"  {tag} {s['pair']} {score}/4{dist_str}")
+        lines.append("")
+
+    if early:
+        lines.append("📌 <b>EARLY STAGE (EMA aligned, structure pending)</b>")
+        longs  = [s["pair"] for s in early if s["direction"] == "LONG"]
+        shorts = [s["pair"] for s in early if s["direction"] == "SHORT"]
+        if longs:
+            lines.append(f"  Bullish: {', '.join(longs)}")
+        if shorts:
+            lines.append(f"  Bearish: {', '.join(shorts)}")
+        lines.append("")
+
+    if not ready and not watch and not early:
+        lines.append("No aligned pairs found. Market is choppy — stay patient.")
+
+    lines.append("Good luck this week. Only trade the 4/4 setups. 💪")
+    _tg_post("\n".join(lines))
 
 
 def scheduled_scan():
@@ -69,12 +137,21 @@ def scheduled_scan():
         logger.exception(f"Scan error: {e}")
 
 
-# Two daily scans: 07:00 UTC (pre-London) and 12:30 UTC (pre-New York)
+def scheduled_weekly_bias():
+    try:
+        run_weekly_bias(send_weekly_bias)
+    except Exception as e:
+        logger.exception(f"Weekly bias error: {e}")
+
+
+# Scans: 07:00 UTC pre-London, 12:30 UTC pre-NY
+# Weekly bias: Sunday 11:00 UTC (6:00 AM CDT)
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(scheduled_scan, "cron", hour=7,  minute=0,  id="pre_london")
-scheduler.add_job(scheduled_scan, "cron", hour=12, minute=30, id="pre_newyork")
+scheduler.add_job(scheduled_scan,         "cron", hour=7,  minute=0,  id="pre_london")
+scheduler.add_job(scheduled_scan,         "cron", hour=12, minute=30, id="pre_newyork")
+scheduler.add_job(scheduled_weekly_bias,  "cron", day_of_week="sun", hour=11, minute=0, id="weekly_bias")
 scheduler.start()
-logger.info("Scheduler started — scans at 07:00 UTC (pre-London) and 12:30 UTC (pre-NY)")
+logger.info("Scheduler started — 07:00 UTC, 12:30 UTC daily | Sunday 11:00 UTC weekly bias")
 
 
 @app.route("/")
@@ -88,7 +165,8 @@ def health():
         "ok": True,
         "status": "running",
         "pairs_tracked": len(pair_status),
-        "alerts_fired": len(recent_alerts)
+        "alerts_fired": len(recent_alerts),
+        "last_scan": last_scan_time,
     })
 
 
@@ -120,6 +198,12 @@ def api_alerts():
 def trigger_scan():
     threading.Thread(target=scheduled_scan, daemon=True).start()
     return jsonify({"ok": True, "message": "Scan triggered"})
+
+
+@app.route("/trigger-weekly", methods=["POST"])
+def trigger_weekly():
+    threading.Thread(target=scheduled_weekly_bias, daemon=True).start()
+    return jsonify({"ok": True, "message": "Weekly bias triggered"})
 
 
 if __name__ == "__main__":

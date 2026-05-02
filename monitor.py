@@ -6,10 +6,11 @@ Analyzes all 28 pairs exactly like Harry does:
 Confluences checked (Harry places fib himself):
   1. 4-TF EMA 50 alignment (D + 4H curving + 2H curving + 1H)
   2. Trend structure (Daily + 4H both HH/HL or LH/LL)
-  3. Price near a key S/R level
+  3. Price near a key S/R level (includes PDH/PDL/PWH/PWL)
   4. 15M signal candle (pin bar or engulfing) at the S/R
+  BONUS: Trend line confluence (diagonal S/R from pivot highs/lows)
 
-Alerts when 3+ confluences stack. Harry then checks his fib zone.
+Alert fires at 4/4. Weekly bias scan runs every Sunday.
 """
 
 import logging
@@ -34,9 +35,10 @@ PAIRS = {
     "XAUUSD": "GC=F",
 }
 
-ALERT_COOLDOWN_HOURS = 4
-SR_PROXIMITY_PCT     = 0.30   # within 0.30% = "at the zone"
-SR_CLUSTER_PCT       = 0.20   # merge levels within 0.20% of each other
+ALERT_COOLDOWN_HOURS  = 4
+SR_PROXIMITY_PCT      = 0.30   # within 0.30% = "at the zone"
+SR_CLUSTER_PCT        = 0.20   # merge levels within 0.20% of each other
+TRENDLINE_PROXIMITY   = 0.25   # within 0.25% of trend line = bonus confluence
 
 pair_status    = {}
 recent_alerts  = []
@@ -53,19 +55,27 @@ def _is_rising(s: pd.Series) -> bool:
 
 
 # ── Trend structure ───────────────────────────────────────────────────────────
-def _pivot_highs(df: pd.DataFrame, n: int = 8) -> list:
-    levels = []
+def _pivot_highs_indexed(df: pd.DataFrame, n: int = 8) -> list:
+    """Return list of (bar_index, price) for pivot highs."""
+    result = []
     for i in range(n, len(df) - n):
         if df["High"].iloc[i] == df["High"].iloc[i - n: i + n + 1].max():
-            levels.append(float(df["High"].iloc[i]))
-    return levels
+            result.append((i, float(df["High"].iloc[i])))
+    return result
 
-def _pivot_lows(df: pd.DataFrame, n: int = 8) -> list:
-    levels = []
+def _pivot_lows_indexed(df: pd.DataFrame, n: int = 8) -> list:
+    """Return list of (bar_index, price) for pivot lows."""
+    result = []
     for i in range(n, len(df) - n):
         if df["Low"].iloc[i] == df["Low"].iloc[i - n: i + n + 1].min():
-            levels.append(float(df["Low"].iloc[i]))
-    return levels
+            result.append((i, float(df["Low"].iloc[i])))
+    return result
+
+def _pivot_highs(df: pd.DataFrame, n: int = 8) -> list:
+    return [p for _, p in _pivot_highs_indexed(df, n)]
+
+def _pivot_lows(df: pd.DataFrame, n: int = 8) -> list:
+    return [p for _, p in _pivot_lows_indexed(df, n)]
 
 def _trend_structure(df: pd.DataFrame, pivot_n: int = 8) -> str:
     """Return BULLISH / BEARISH / RANGING based on last 2 pivot highs and lows."""
@@ -84,7 +94,43 @@ def _trend_structure(df: pd.DataFrame, pivot_n: int = 8) -> str:
     return "RANGING"
 
 
+# ── Trend line ────────────────────────────────────────────────────────────────
+def _trendline_value(df: pd.DataFrame, direction: str, pivot_n: int = 10) -> float | None:
+    """
+    Extrapolate trend line to current bar.
+    LONG  → ascending line through last 2 pivot lows
+    SHORT → descending line through last 2 pivot highs
+    """
+    current_bar = len(df) - 1
+    if direction == "SHORT":
+        pts = _pivot_highs_indexed(df, pivot_n)
+        if len(pts) < 2:
+            return None
+        (i1, p1), (i2, p2) = pts[-2], pts[-1]
+    else:
+        pts = _pivot_lows_indexed(df, pivot_n)
+        if len(pts) < 2:
+            return None
+        (i1, p1), (i2, p2) = pts[-2], pts[-1]
+
+    if i2 == i1:
+        return None
+    slope = (p2 - p1) / (i2 - i1)
+    return p2 + slope * (current_bar - i2)
+
+
 # ── S/R levels ────────────────────────────────────────────────────────────────
+def _pdh_pdl(df_d: pd.DataFrame) -> list:
+    """Previous Day High/Low and Previous Week High/Low."""
+    levels = []
+    if len(df_d) >= 2:
+        levels.append(float(df_d["High"].iloc[-2]))  # PDH
+        levels.append(float(df_d["Low"].iloc[-2]))   # PDL
+    if len(df_d) >= 6:
+        levels.append(float(df_d["High"].iloc[-6:-1].max()))  # PWH
+        levels.append(float(df_d["Low"].iloc[-6:-1].min()))   # PWL
+    return levels
+
 def _cluster_levels(raw: list, cluster_pct: float) -> list:
     if not raw:
         return []
@@ -98,9 +144,12 @@ def _cluster_levels(raw: list, cluster_pct: float) -> list:
     return [sum(c) / len(c) for c in clusters]
 
 def _find_sr_levels(df_d: pd.DataFrame, df_4h: pd.DataFrame) -> list:
-    """Combine Daily + 4H pivot levels, cluster them, return significant ones."""
-    raw = (_pivot_highs(df_d, 8) + _pivot_lows(df_d, 8) +
-           _pivot_highs(df_4h, 10) + _pivot_lows(df_4h, 10))
+    """Daily + 4H pivots + PDH/PDL/PWH/PWL, clustered."""
+    raw = (
+        _pivot_highs(df_d, 8) + _pivot_lows(df_d, 8) +
+        _pivot_highs(df_4h, 10) + _pivot_lows(df_4h, 10) +
+        _pdh_pdl(df_d)
+    )
     return _cluster_levels(raw, SR_CLUSTER_PCT)
 
 def _nearest_sr(price: float, levels: list) -> tuple:
@@ -111,6 +160,12 @@ def _nearest_sr(price: float, levels: list) -> tuple:
     dist_pct = abs(nearest - price) / price * 100
     return nearest, round(dist_pct, 3)
 
+def _levels_above_below(price: float, levels: list, n: int = 3) -> tuple:
+    """Return (n closest above, n closest below) sorted nearest first."""
+    above = sorted([l for l in levels if l > price], key=lambda l: l - price)
+    below = sorted([l for l in levels if l < price], key=lambda l: price - l)
+    return above[:n], below[:n]
+
 
 # ── 15M signal candle ─────────────────────────────────────────────────────────
 def _signal_candle(df_15m: pd.DataFrame, direction: str) -> str:
@@ -118,7 +173,7 @@ def _signal_candle(df_15m: pd.DataFrame, direction: str) -> str:
     if len(df_15m) < 3:
         return "None"
 
-    c    = df_15m.iloc[-2]   # last closed candle
+    c    = df_15m.iloc[-2]
     prev = df_15m.iloc[-3]
 
     o, h, l, cl = float(c["Open"]), float(c["High"]), float(c["Low"]), float(c["Close"])
@@ -131,22 +186,14 @@ def _signal_candle(df_15m: pd.DataFrame, direction: str) -> str:
     lower_wick = min(o, cl) - l
 
     if direction == "LONG":
-        # Bullish pin bar: lower wick >= 2× body, lower wick dominant
         if body > 0 and lower_wick >= 2 * body and lower_wick > upper_wick:
             return "Pin Bar (Bullish)"
-        # Bullish engulfing
-        if (cl > o and
-                cl > float(prev["Open"]) and
-                o  < float(prev["Close"])):
+        if (cl > o and cl > float(prev["Open"]) and o < float(prev["Close"])):
             return "Engulfing (Bullish)"
     elif direction == "SHORT":
-        # Bearish pin bar: upper wick >= 2× body, upper wick dominant
         if body > 0 and upper_wick >= 2 * body and upper_wick > lower_wick:
             return "Pin Bar (Bearish)"
-        # Bearish engulfing
-        if (cl < o and
-                cl < float(prev["Open"]) and
-                o  > float(prev["Close"])):
+        if (cl < o and cl < float(prev["Open"]) and o > float(prev["Close"])):
             return "Engulfing (Bearish)"
 
     return "None"
@@ -160,6 +207,9 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         "daily_trend": "RANGING", "h4_trend": "RANGING",
         "trends_agree": False,
         "nearest_sr": None, "sr_dist_pct": None, "at_sr": False,
+        "sr_above": [], "sr_below": [],
+        "pdh": None, "pdl": None,
+        "trendline_val": None, "at_trendline": False, "trendline_dist_pct": None,
         "signal_15m": "None", "has_signal": False,
         "confluence_score": 0, "confluence_detail": [],
         "alert": False,
@@ -182,9 +232,9 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-        ohlc  = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
-        df_4h = df_1h.resample("4h").agg(ohlc).dropna()
-        df_2h = df_1h.resample("2h").agg(ohlc).dropna()
+        ohlc   = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        df_4h  = df_1h.resample("4h").agg(ohlc).dropna()
+        df_2h  = df_1h.resample("2h").agg(ohlc).dropna()
         df_15m = yf.download(yf_symbol, period="5d", interval="15m",
                              progress=False, auto_adjust=True)
         if isinstance(df_15m.columns, pd.MultiIndex):
@@ -193,6 +243,11 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         if len(df_4h) < 55 or len(df_2h) < 55:
             status["error"] = "Not enough resampled bars"
             return status
+
+        # ── PDH / PDL ────────────────────────────────────────────────────────
+        if len(df_d) >= 2:
+            status["pdh"] = round(float(df_d["High"].iloc[-2]), 5)
+            status["pdl"] = round(float(df_d["Low"].iloc[-2]),  5)
 
         # ── EMA 50 ───────────────────────────────────────────────────────────
         ema_d_s  = _ema(df_d["Close"])
@@ -224,7 +279,7 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         status["direction"]   = "LONG" if bull_ema else ("SHORT" if bear_ema else "NONE")
 
         if status["direction"] == "NONE":
-            return status  # No EMA alignment = no point going further
+            return status
 
         direction = status["direction"]
 
@@ -242,9 +297,21 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         # ── S/R levels ───────────────────────────────────────────────────────
         sr_levels = _find_sr_levels(df_d, df_4h)
         nearest_sr, sr_dist = _nearest_sr(price, sr_levels)
+        above, below = _levels_above_below(price, sr_levels)
+
         status["nearest_sr"]  = round(nearest_sr, 5) if nearest_sr else None
         status["sr_dist_pct"] = sr_dist
         status["at_sr"]       = sr_dist is not None and sr_dist <= SR_PROXIMITY_PCT
+        status["sr_above"]    = [round(l, 5) for l in above]
+        status["sr_below"]    = [round(l, 5) for l in below]
+
+        # ── Trend line (bonus) ───────────────────────────────────────────────
+        tl_val = _trendline_value(df_4h, direction, pivot_n=10)
+        if tl_val is not None:
+            tl_dist = abs(tl_val - price) / price * 100
+            status["trendline_val"]      = round(tl_val, 5)
+            status["trendline_dist_pct"] = round(tl_dist, 3)
+            status["at_trendline"]       = tl_dist <= TRENDLINE_PROXIMITY
 
         # ── 15M signal candle ────────────────────────────────────────────────
         if len(df_15m) >= 3:
@@ -256,7 +323,7 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         score  = 0
         detail = []
 
-        # 1. EMA (always true if we got here)
+        # 1. EMA
         score += 1
         side  = "below" if direction == "LONG" else "above"
         curve = "curving up" if direction == "LONG" else "curving down"
@@ -272,9 +339,9 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         # 3. S/R zone
         if status["at_sr"]:
             score += 1
-            detail.append(f"S/R: {nearest_sr} ({sr_dist}% away) - AT ZONE")
+            detail.append(f"S/R: {nearest_sr:.5f} ({sr_dist}% away) - AT ZONE")
         elif nearest_sr:
-            detail.append(f"S/R: {nearest_sr} ({sr_dist}% away) - not at zone yet")
+            detail.append(f"S/R: {nearest_sr:.5f} ({sr_dist}% away) - not at zone yet")
 
         # 4. 15M signal
         if status["has_signal"]:
@@ -283,9 +350,16 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         else:
             detail.append(f"15M signal: none yet")
 
+        # BONUS: Trend line
+        if status["at_trendline"]:
+            detail.append(
+                f"BONUS - Trend line: {status['trendline_val']} "
+                f"({status['trendline_dist_pct']}% away) - EXTRA CONFLUENCE"
+            )
+
         status["confluence_score"]  = score
         status["confluence_detail"] = detail
-        status["alert"] = score >= 4   # only alert on 4/4 confluences
+        status["alert"] = score >= 4
 
     except Exception as exc:
         logger.exception(f"[{name}] Error: {exc}")
@@ -294,7 +368,7 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
     return status
 
 
-# ── Scan all 28 pairs ────────────────────────────────────────────────────────
+# ── Scan all 28 pairs ─────────────────────────────────────────────────────────
 def run_scan(send_telegram_fn):
     logger.info("=== ZSCN brain scan started ===")
     results = {}
@@ -335,6 +409,44 @@ def run_scan(send_telegram_fn):
                 recent_alerts.pop()
 
             send_telegram_fn(status)
-            logger.info(f"[{name}] {direction} - {status['confluence_score']}/4 confluences - alert sent")
+            logger.info(f"[{name}] {direction} - 4/4 confluences - alert sent")
 
     logger.info(f"=== Scan complete. {len(results)} pairs checked ===")
+
+
+# ── Weekly bias scan (Sundays) ────────────────────────────────────────────────
+def run_weekly_bias(send_weekly_fn):
+    """
+    Sunday morning scan. Categorises all 28 pairs into:
+      - Ready (4/4) — full setup, check fib and enter
+      - Watch  (2-3/4) — EMA + trend agree, approaching S/R
+      - Early  (1/4) — EMA aligned only, structure not confirmed
+    """
+    logger.info("=== Weekly bias scan started ===")
+    results = {}
+    threads = []
+
+    def worker(name, yf_sym):
+        results[name] = _check_pair(name, yf_sym)
+
+    for name, yf_sym in PAIRS.items():
+        t = threading.Thread(target=worker, args=(name, yf_sym))
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join(timeout=45)
+
+    with _lock:
+        for name, status in results.items():
+            pair_status[name] = status
+
+    ready = [s for s in results.values() if s.get("confluence_score", 0) >= 4]
+    watch = [s for s in results.values()
+             if s.get("ema_aligned") and s.get("trends_agree")
+             and s.get("confluence_score", 0) < 4]
+    early = [s for s in results.values()
+             if s.get("ema_aligned") and not s.get("trends_agree")]
+
+    send_weekly_fn(ready, watch, early)
+    logger.info(f"=== Weekly bias complete. Ready={len(ready)} Watch={len(watch)} Early={len(early)} ===")
