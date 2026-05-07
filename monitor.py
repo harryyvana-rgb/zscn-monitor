@@ -9,8 +9,14 @@ Confluences checked (Harry places fib himself):
   3. Price near a key S/R level (includes PDH/PDL/PWH/PWL)
   4. 15M signal candle (pin bar or engulfing) at the S/R
   BONUS: Trend line confluence (diagonal S/R from pivot highs/lows)
+  BONUS: Break and retest (broken S/R level now acting as opposite S/R)
+  BONUS: 2H trend structure agrees with Daily + 4H
+  BONUS: HIGH quality signal candle (wick >= 3x body, or clean engulfing)
 
-Alert fires at 4/4. Weekly bias scan runs every Sunday.
+Alert fires at 4/4.
+Grade A+ = 4/4 + 2+ bonus conditions (HIGH CONVICTION).
+Grade A  = 4/4 standard.
+Grade WATCH = 3/4 early warning.
 """
 
 import logging
@@ -169,34 +175,67 @@ def _levels_above_below(price: float, levels: list, n: int = 3) -> tuple:
     return above[:n], below[:n]
 
 
-def _calc_sl_tp(price: float, direction: str, sr_above: list, sr_below: list) -> tuple:
+def _calc_sl_tp(price: float, direction: str, sr_above: list, sr_below: list,
+                df_4h=None, retest_level=None) -> tuple:
     """
-    SL: just beyond the nearest S/R level (SL_BUFFER_PCT beyond it).
-    TP: 1:3 R:R from entry price.
-    Returns (sl, tp) or (None, None).
+    SL placed below the actual swing low of recent rejection candles (LONG)
+    or above recent swing high (SHORT) — matches how Harry places SL manually.
+
+    Priority order:
+      1. Retest level (if break+retest detected) — SL just beyond that level
+      2. Lowest wick of last 3 closed 4H bars (the rejection candles at the zone)
+      3. Nearest S/R level below/above as fallback
+
+    TP = 1:3 R:R from current price.
     """
+    sl_buf = 0.0005  # 0.05% beyond the low/high
+
     if direction == "LONG":
-        if not sr_below:
+        if retest_level is not None:
+            sl = retest_level * (1 - sl_buf)
+        elif df_4h is not None and len(df_4h) >= 4:
+            recent_low = float(df_4h["Low"].iloc[-4:-1].min())
+            sl = recent_low * (1 - sl_buf)
+        elif sr_below:
+            sl = sr_below[0] * (1 - SL_BUFFER_PCT / 100)
+        else:
             return None, None
-        sl_level = sr_below[0]
-        sl = sl_level * (1 - SL_BUFFER_PCT / 100)
-        tp = price + (price - sl) * 3
+        risk = price - sl
+        if risk <= 0:
+            return None, None
+        tp = price + risk * 3
+
     elif direction == "SHORT":
-        if not sr_above:
+        if retest_level is not None:
+            sl = retest_level * (1 + sl_buf)
+        elif df_4h is not None and len(df_4h) >= 4:
+            recent_high = float(df_4h["High"].iloc[-4:-1].max())
+            sl = recent_high * (1 + sl_buf)
+        elif sr_above:
+            sl = sr_above[0] * (1 + SL_BUFFER_PCT / 100)
+        else:
             return None, None
-        sl_level = sr_above[0]
-        sl = sl_level * (1 + SL_BUFFER_PCT / 100)
-        tp = price - (sl - price) * 3
+        risk = sl - price
+        if risk <= 0:
+            return None, None
+        tp = price - risk * 3
+
     else:
         return None, None
+
     return round(sl, 5), round(tp, 5)
 
 
 # ── 15M signal candle ─────────────────────────────────────────────────────────
-def _signal_candle(df_15m: pd.DataFrame, direction: str) -> str:
-    """Check last CLOSED 15M candle for pin bar or engulfing."""
+def _signal_candle(df_15m: pd.DataFrame, direction: str) -> tuple:
+    """
+    Check last CLOSED 15M candle for pin bar or engulfing.
+    Returns (signal_type, quality) where quality is 'HIGH', 'MEDIUM', or 'None'.
+    HIGH: wick >= 3x body OR full body engulfing.
+    MEDIUM: wick >= 2x body OR partial engulfing.
+    """
     if len(df_15m) < 3:
-        return "None"
+        return "None", "None"
 
     c    = df_15m.iloc[-2]
     prev = df_15m.iloc[-3]
@@ -205,23 +244,97 @@ def _signal_candle(df_15m: pd.DataFrame, direction: str) -> str:
     body        = abs(cl - o)
     total       = h - l
     if total < 1e-10:
-        return "None"
+        return "None", "None"
 
     upper_wick = h - max(o, cl)
     lower_wick = min(o, cl) - l
 
     if direction == "LONG":
         if body > 0 and lower_wick >= 2 * body and lower_wick > upper_wick:
-            return "Pin Bar (Bullish)"
-        if (cl > o and cl > float(prev["Open"]) and o < float(prev["Close"])):
-            return "Engulfing (Bullish)"
+            quality = "HIGH" if lower_wick >= 3 * body else "MEDIUM"
+            return "Pin Bar (Bullish)", quality
+        if cl > o and cl > float(prev["Open"]) and o < float(prev["Close"]):
+            # Full engulfing: close fully beyond prev open = HIGH
+            quality = "HIGH" if cl >= float(prev["High"]) or o <= float(prev["Low"]) else "MEDIUM"
+            return "Engulfing (Bullish)", quality
     elif direction == "SHORT":
         if body > 0 and upper_wick >= 2 * body and upper_wick > lower_wick:
-            return "Pin Bar (Bearish)"
-        if (cl < o and cl < float(prev["Open"]) and o > float(prev["Close"])):
-            return "Engulfing (Bearish)"
+            quality = "HIGH" if upper_wick >= 3 * body else "MEDIUM"
+            return "Pin Bar (Bearish)", quality
+        if cl < o and cl < float(prev["Open"]) and o > float(prev["Close"]):
+            quality = "HIGH" if cl <= float(prev["Low"]) or o >= float(prev["High"]) else "MEDIUM"
+            return "Engulfing (Bearish)", quality
 
-    return "None"
+    return "None", "None"
+
+
+# ── Break and retest ──────────────────────────────────────────────────────────
+def _find_break_retest(df_4h: pd.DataFrame, sr_levels: list,
+                       price: float, direction: str) -> dict:
+    """
+    Detect break-and-retest of S/R levels on 4H.
+    LONG:  old resistance broken (price closed above), now retesting from above = new support.
+    SHORT: old support broken (price closed below), now retesting from below = new resistance.
+    Valid retest window: 2–25 bars after the break.
+    """
+    result = {"is_retest": False, "retest_level": None,
+              "retest_type": None, "bars_since_break": None}
+
+    if len(df_4h) < 30:
+        return result
+
+    closes = df_4h["Close"].values[-30:]
+
+    for level in sr_levels:
+        dist_pct = abs(price - level) / price * 100
+        if dist_pct > SR_PROXIMITY_PCT:
+            continue
+
+        if direction == "LONG" and price >= level:
+            # Find most recent bar where price flipped from below to above the level
+            break_idx = None
+            for i in range(len(closes) - 2, 1, -1):
+                if closes[i] > level and closes[i - 1] < level:
+                    break_idx = i
+                    break
+            if break_idx is None:
+                continue
+            bars_since = len(closes) - 1 - break_idx
+            if bars_since < 2 or bars_since > 25:
+                continue
+            # Confirm there were multiple bars below before the break
+            pre = closes[:break_idx]
+            if sum(1 for c in pre[-6:] if c < level) >= 2:
+                result.update({
+                    "is_retest": True,
+                    "retest_level": round(level, 5),
+                    "retest_type": "Broken Resistance → Now Support",
+                    "bars_since_break": bars_since,
+                })
+                return result
+
+        elif direction == "SHORT" and price <= level:
+            break_idx = None
+            for i in range(len(closes) - 2, 1, -1):
+                if closes[i] < level and closes[i - 1] > level:
+                    break_idx = i
+                    break
+            if break_idx is None:
+                continue
+            bars_since = len(closes) - 1 - break_idx
+            if bars_since < 2 or bars_since > 25:
+                continue
+            pre = closes[:break_idx]
+            if sum(1 for c in pre[-6:] if c > level) >= 2:
+                result.update({
+                    "is_retest": True,
+                    "retest_level": round(level, 5),
+                    "retest_type": "Broken Support → Now Resistance",
+                    "bars_since_break": bars_since,
+                })
+                return result
+
+    return result
 
 
 # ── Main pair analysis ────────────────────────────────────────────────────────
@@ -235,9 +348,11 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         "sr_above": [], "sr_below": [],
         "pdh": None, "pdl": None,
         "trendline_val": None, "at_trendline": False, "trendline_dist_pct": None,
-        "signal_15m": "None", "has_signal": False,
+        "h2_trend": "RANGING", "all_trends_agree": False,
+        "is_retest": False, "retest_level": None, "retest_type": None,
+        "signal_15m": "None", "signal_quality": "None", "has_signal": False,
         "confluence_score": 0, "confluence_detail": [],
-        "sl": None, "tp": None,
+        "sl": None, "tp": None, "alert_grade": "—",
         "alert": False, "early_warning": False,
         "last_checked": datetime.now(timezone.utc).strftime("%H:%M UTC"),
         "error": None,
@@ -312,13 +427,20 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         # ── Trend structure ──────────────────────────────────────────────────
         d_trend  = _trend_structure(df_d,  pivot_n=8)
         h4_trend = _trend_structure(df_4h, pivot_n=10)
+        h2_trend = _trend_structure(df_2h, pivot_n=6)
         status["daily_trend"] = d_trend
         status["h4_trend"]    = h4_trend
+        status["h2_trend"]    = h2_trend
         trends_agree = (
             (direction == "LONG"  and d_trend == "BULLISH" and h4_trend == "BULLISH") or
             (direction == "SHORT" and d_trend == "BEARISH" and h4_trend == "BEARISH")
         )
-        status["trends_agree"] = trends_agree
+        all_trends_agree = trends_agree and (
+            (direction == "LONG"  and h2_trend == "BULLISH") or
+            (direction == "SHORT" and h2_trend == "BEARISH")
+        )
+        status["trends_agree"]     = trends_agree
+        status["all_trends_agree"] = all_trends_agree
 
         # ── S/R levels ───────────────────────────────────────────────────────
         sr_levels = _find_sr_levels(df_d, df_4h)
@@ -339,57 +461,89 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
             status["trendline_dist_pct"] = round(tl_dist, 3)
             status["at_trendline"]       = tl_dist <= TRENDLINE_PROXIMITY
 
+        # ── Break and retest (bonus) ─────────────────────────────────────────
+        br = _find_break_retest(df_4h, sr_levels, price, direction)
+        status.update(br)
+
         # ── 15M signal candle ────────────────────────────────────────────────
         if len(df_15m) >= 3:
-            sig = _signal_candle(df_15m, direction)
-            status["signal_15m"] = sig
-            status["has_signal"] = sig != "None"
+            sig, sig_quality = _signal_candle(df_15m, direction)
+            status["signal_15m"]    = sig
+            status["signal_quality"] = sig_quality
+            status["has_signal"]    = sig != "None"
 
         # ── Confluence score ─────────────────────────────────────────────────
         score  = 0
         detail = []
 
-        # 1. EMA
+        # 1. EMA (4 TFs aligned)
         score += 1
         side  = "below" if direction == "LONG" else "above"
         curve = "curving up" if direction == "LONG" else "curving down"
         detail.append(f"EMA 50: Daily {side}, 4H {side}+{curve}, 2H {side}+{curve}, 1H {side}")
 
-        # 2. Trend structure
+        # 2. Trend structure (Daily + 4H)
         if trends_agree:
             score += 1
-            detail.append(f"Trend: Daily {d_trend} + 4H {h4_trend} - both agree")
+            detail.append(f"Trend: Daily {d_trend} + 4H {h4_trend} — both agree")
         else:
-            detail.append(f"Trend: Daily {d_trend} / 4H {h4_trend} - partial")
+            detail.append(f"Trend: Daily {d_trend} / 4H {h4_trend} — partial")
 
         # 3. S/R zone
         if status["at_sr"]:
             score += 1
-            detail.append(f"S/R: {nearest_sr:.5f} ({sr_dist}% away) - AT ZONE")
+            detail.append(f"S/R: {nearest_sr:.5f} ({sr_dist}% away) — AT ZONE")
         elif nearest_sr:
-            detail.append(f"S/R: {nearest_sr:.5f} ({sr_dist}% away) - not at zone yet")
+            detail.append(f"S/R: {nearest_sr:.5f} ({sr_dist}% away) — not at zone yet")
 
         # 4. 15M signal
         if status["has_signal"]:
             score += 1
-            detail.append(f"15M signal: {status['signal_15m']} - CONFIRMED")
+            qual_tag = f" [{status['signal_quality']} quality]" if status["signal_quality"] != "None" else ""
+            detail.append(f"15M signal: {status['signal_15m']}{qual_tag} — CONFIRMED")
         else:
-            detail.append(f"15M signal: none yet")
-
-        # BONUS: Trend line
-        if status["at_trendline"]:
-            detail.append(
-                f"BONUS - Trend line: {status['trendline_val']} "
-                f"({status['trendline_dist_pct']}% away) - EXTRA CONFLUENCE"
-            )
+            detail.append("15M signal: none yet")
 
         status["confluence_score"]  = score
         status["confluence_detail"] = detail
-        status["alert"] = score >= 4
+        status["alert"]        = score >= 4
         status["early_warning"] = score == 3
 
-        # SL/TP based on nearest S/R levels (1:3 R:R)
-        sl, tp = _calc_sl_tp(price, direction, above, below)
+        # ── Bonus confluences (don't raise score, improve grade) ────────────
+        if all_trends_agree:
+            detail.append(f"BONUS — 2H trend: {h2_trend} — all 3 TFs agree")
+        elif trends_agree:
+            detail.append(f"2H trend: {h2_trend} — Daily+4H agree, 2H diverges")
+
+        if status["at_trendline"]:
+            detail.append(
+                f"BONUS — Trend line: {status['trendline_val']} "
+                f"({status['trendline_dist_pct']}% away) — DIAGONAL S/R"
+            )
+
+        if status["is_retest"]:
+            detail.append(
+                f"BONUS — Break & Retest: {status['retest_level']} — "
+                f"{status['retest_type']} ({status['bars_since_break']} bars ago)"
+            )
+
+        # ── Alert grade ───────────────────────────────────────────────────────
+        bonus_count = sum([
+            all_trends_agree,
+            status.get("at_trendline", False),
+            status.get("is_retest", False),
+            status.get("signal_quality") == "HIGH",
+        ])
+        if score >= 4:
+            status["alert_grade"] = "A+" if bonus_count >= 2 else "A"
+        elif score == 3:
+            status["alert_grade"] = "WATCH"
+        else:
+            status["alert_grade"] = "—"
+
+        # ── SL/TP — based on actual swing low/high of rejection candles ──────
+        retest_lvl = status["retest_level"] if status["is_retest"] else None
+        sl, tp = _calc_sl_tp(price, direction, above, below, df_4h, retest_lvl)
         status["sl"] = sl
         status["tp"] = tp
 

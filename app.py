@@ -41,9 +41,15 @@ def send_early_warning(status: dict):
     score = status["confluence_score"]
     tag   = "🟢 LONG" if d == "LONG" else "🔴 SHORT"
 
+    # If break & retest detected on a 3/4, bump the urgency
+    is_retest = status.get("is_retest", False)
+    header    = f"⚠️ WATCH — {tag} <b>{pair}</b>"
+    if is_retest:
+        header = f"⚠️ BREAK+RETEST FORMING — {tag} <b>{pair}</b>"
+
     lines = [
-        f"⚠️ EARLY WARNING — {tag} <b>{pair}</b>",
-        f"Score: <b>{score}/4</b> — Setup is forming, 1 confluence missing",
+        header,
+        f"Score: <b>{score}/4</b> — 1 confluence missing",
         f"Price: <b>{price}</b>",
         "",
     ]
@@ -121,11 +127,17 @@ def send_telegram(status: dict):
     pair  = status["pair"]
     price = status["price"]
     score = status["confluence_score"]
+    grade = status.get("alert_grade", "A")
     tag   = "🟢 LONG" if d == "LONG" else "🔴 SHORT"
 
+    if grade == "A+":
+        header = f"🔥 HIGH CONVICTION — {tag} <b>{pair}</b>"
+    else:
+        header = f"✅ ENTRY SIGNAL — {tag} <b>{pair}</b>"
+
     lines = [
-        f"{tag} — <b>{pair}</b>",
-        f"Price: <b>{price}</b>   |   Confluences: <b>{score}/4</b>",
+        header,
+        f"Grade: <b>{grade}</b>   |   Price: <b>{price}</b>   |   Confluences: <b>{score}/4</b>",
         "",
     ]
 
