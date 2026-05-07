@@ -39,10 +39,12 @@ ALERT_COOLDOWN_HOURS  = 4
 SR_PROXIMITY_PCT      = 0.30   # within 0.30% = "at the zone"
 SR_CLUSTER_PCT        = 0.20   # merge levels within 0.20% of each other
 TRENDLINE_PROXIMITY   = 0.25   # within 0.25% of trend line = bonus confluence
+SL_BUFFER_PCT         = 0.10   # SL placed 0.10% beyond the S/R level
 
-pair_status    = {}
-recent_alerts  = []
-alert_cooldown = {}
+pair_status         = {}
+recent_alerts       = []
+alert_cooldown      = {}
+early_alert_cooldown = {}
 _lock = threading.Lock()
 
 
@@ -167,6 +169,29 @@ def _levels_above_below(price: float, levels: list, n: int = 3) -> tuple:
     return above[:n], below[:n]
 
 
+def _calc_sl_tp(price: float, direction: str, sr_above: list, sr_below: list) -> tuple:
+    """
+    SL: just beyond the nearest S/R level (SL_BUFFER_PCT beyond it).
+    TP: 1:3 R:R from entry price.
+    Returns (sl, tp) or (None, None).
+    """
+    if direction == "LONG":
+        if not sr_below:
+            return None, None
+        sl_level = sr_below[0]
+        sl = sl_level * (1 - SL_BUFFER_PCT / 100)
+        tp = price + (price - sl) * 3
+    elif direction == "SHORT":
+        if not sr_above:
+            return None, None
+        sl_level = sr_above[0]
+        sl = sl_level * (1 + SL_BUFFER_PCT / 100)
+        tp = price - (sl - price) * 3
+    else:
+        return None, None
+    return round(sl, 5), round(tp, 5)
+
+
 # ── 15M signal candle ─────────────────────────────────────────────────────────
 def _signal_candle(df_15m: pd.DataFrame, direction: str) -> str:
     """Check last CLOSED 15M candle for pin bar or engulfing."""
@@ -212,7 +237,8 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         "trendline_val": None, "at_trendline": False, "trendline_dist_pct": None,
         "signal_15m": "None", "has_signal": False,
         "confluence_score": 0, "confluence_detail": [],
-        "alert": False,
+        "sl": None, "tp": None,
+        "alert": False, "early_warning": False,
         "last_checked": datetime.now(timezone.utc).strftime("%H:%M UTC"),
         "error": None,
     }
@@ -360,6 +386,12 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         status["confluence_score"]  = score
         status["confluence_detail"] = detail
         status["alert"] = score >= 4
+        status["early_warning"] = score == 3
+
+        # SL/TP based on nearest S/R levels (1:3 R:R)
+        sl, tp = _calc_sl_tp(price, direction, above, below)
+        status["sl"] = sl
+        status["tp"] = tp
 
     except Exception as exc:
         logger.exception(f"[{name}] Error: {exc}")
@@ -369,7 +401,7 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
 
 
 # ── Scan all 28 pairs ─────────────────────────────────────────────────────────
-def run_scan(send_telegram_fn):
+def run_scan(send_telegram_fn, send_early_warning_fn=None):
     logger.info("=== ZSCN brain scan started ===")
     results = {}
     threads = []
@@ -390,26 +422,44 @@ def run_scan(send_telegram_fn):
     with _lock:
         for name, status in results.items():
             pair_status[name] = status
+            direction    = status.get("direction", "NONE")
+            score        = status.get("confluence_score", 0)
 
-            if not status.get("alert"):
+            if not status.get("ema_aligned") or direction == "NONE":
                 continue
 
-            direction    = status["direction"]
             cooldown_key = f"{name}_{direction}"
-            last_alerted = alert_cooldown.get(cooldown_key)
+            early_key    = f"{name}_{direction}_early"
 
-            if last_alerted and (now - last_alerted) < timedelta(hours=ALERT_COOLDOWN_HOURS):
-                logger.info(f"[{name}] {direction} - cooldown active, skipping")
-                continue
+            # ── Full alert (4/4) ─────────────────────────────────────────────
+            if status.get("alert"):
+                last_alerted = alert_cooldown.get(cooldown_key)
+                if last_alerted and (now - last_alerted) < timedelta(hours=ALERT_COOLDOWN_HOURS):
+                    logger.info(f"[{name}] {direction} - full cooldown active, skipping")
+                    continue
+                alert_cooldown[cooldown_key] = now
+                # reset early cooldown so it won't spam after a full alert fires
+                early_alert_cooldown.pop(early_key, None)
+                alert = {**status, "received_at": now.strftime("%Y-%m-%d %H:%M UTC")}
+                recent_alerts.insert(0, alert)
+                if len(recent_alerts) > 100:
+                    recent_alerts.pop()
+                send_telegram_fn(status)
+                logger.info(f"[{name}] {direction} - 4/4 - FULL ALERT sent")
 
-            alert_cooldown[cooldown_key] = now
-            alert = {**status, "received_at": now.strftime("%Y-%m-%d %H:%M UTC")}
-            recent_alerts.insert(0, alert)
-            if len(recent_alerts) > 100:
-                recent_alerts.pop()
-
-            send_telegram_fn(status)
-            logger.info(f"[{name}] {direction} - 4/4 confluences - alert sent")
+            # ── Early warning (3/4) ──────────────────────────────────────────
+            elif score == 3 and send_early_warning_fn is not None:
+                last_early = early_alert_cooldown.get(early_key)
+                if last_early and (now - last_early) < timedelta(hours=ALERT_COOLDOWN_HOURS):
+                    logger.info(f"[{name}] {direction} - early cooldown active, skipping")
+                    continue
+                early_alert_cooldown[early_key] = now
+                early = {**status, "received_at": now.strftime("%Y-%m-%d %H:%M UTC")}
+                recent_alerts.insert(0, early)
+                if len(recent_alerts) > 100:
+                    recent_alerts.pop()
+                send_early_warning_fn(status)
+                logger.info(f"[{name}] {direction} - 3/4 - early warning sent")
 
     logger.info(f"=== Scan complete. {len(results)} pairs checked ===")
 
