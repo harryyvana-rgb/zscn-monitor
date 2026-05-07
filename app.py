@@ -34,63 +34,54 @@ def _tg_post(msg: str):
         logger.error(f"Telegram error: {e}")
 
 
-def send_early_warning(status: dict):
-    d     = status["direction"]
-    pair  = status["pair"]
+def _confluence_tick(item: str) -> str:
+    """Assign the correct tick icon to a confluence detail line."""
+    if "BONUS" in item:
+        return "⭐"
+    if any(kw in item for kw in ("partial", "not at zone", "none yet", "diverges")):
+        return "⏳"
+    return "✅"
+
+
+def _build_alert_body(status: dict, is_early: bool) -> list:
+    """
+    Shared body for both full alerts and early warnings.
+    Both send identical information — early warning adds a 'Waiting for' line.
+    """
+    lines = []
     price = status["price"]
-    score = status["confluence_score"]
-    tag   = "🟢 LONG" if d == "LONG" else "🔴 SHORT"
+    d     = status["direction"]
 
-    # If break & retest detected on a 3/4, bump the urgency
-    is_retest = status.get("is_retest", False)
-    header    = f"⚠️ WATCH — {tag} <b>{pair}</b>"
-    if is_retest:
-        header = f"⚠️ BREAK+RETEST FORMING — {tag} <b>{pair}</b>"
-
-    lines = [
-        header,
-        f"Score: <b>{score}/4</b> — 1 confluence missing",
-        f"Price: <b>{price}</b>",
-        "",
-    ]
-
+    # ── Confluence checklist ─────────────────────────────────────────────────
     for item in status.get("confluence_detail", []):
-        if any(kw in item for kw in ("AT ZONE", "agree", "CONFIRMED", "below", "above")):
-            tick = "✅"
-        elif "BONUS" in item:
-            tick = "⭐"
-        elif any(kw in item for kw in ("partial", "not at zone", "none yet")):
-            tick = "⏳"
-        else:
-            tick = "✅"
-        lines.append(f"{tick} {item}")
+        lines.append(f"{_confluence_tick(item)} {item}")
 
-    # What's missing
-    missing = []
-    if not status.get("trends_agree"):
-        missing.append("trend structure (Daily + 4H not both aligned yet)")
-    if not status.get("at_sr"):
-        sr_dist = status.get("sr_dist_pct")
-        nearest = status.get("nearest_sr")
-        if nearest and sr_dist:
-            missing.append(f"S/R zone — price is {sr_dist}% from {nearest}, not there yet")
-        else:
-            missing.append("S/R zone")
-    if not status.get("has_signal"):
-        missing.append("15M signal candle (watch for pin bar or engulfing)")
+    # ── What's still missing (early warning only) ────────────────────────────
+    if is_early:
+        missing = []
+        if not status.get("trends_agree"):
+            missing.append("trend structure — Daily + 4H not both aligned yet")
+        if not status.get("at_sr"):
+            dist    = status.get("sr_dist_pct")
+            nearest = status.get("nearest_sr")
+            if nearest and dist:
+                missing.append(f"S/R zone — {dist}% away from {nearest}, not there yet")
+            else:
+                missing.append("S/R zone — not identified yet")
+        if not status.get("has_signal"):
+            missing.append("15M signal candle — watch for pin bar or engulfing at the zone")
+        if missing:
+            lines.append("")
+            lines.append(f"⏳ <b>Waiting for:</b> {missing[0]}")
 
-    if missing:
-        lines.append("")
-        lines.append(f"⏳ <b>Missing:</b> {missing[0]}")
-
-    # Key levels
+    # ── S/R map ──────────────────────────────────────────────────────────────
     above = status.get("sr_above", [])
     below = status.get("sr_below", [])
     pdh   = status.get("pdh")
     pdl   = status.get("pdl")
 
     lines.append("")
-    lines.append("📊 <b>Key Levels</b>")
+    lines.append("📊 <b>S/R Map</b>")
     if pdh:
         lines.append(f"  PDH: {pdh}")
     if pdl:
@@ -99,26 +90,52 @@ def send_early_warning(status: dict):
         lines.append(f"  Resistance above: {' | '.join(str(l) for l in above)}")
     if below:
         lines.append(f"  Support below:    {' | '.join(str(l) for l in below)}")
-
     if status.get("at_trendline"):
-        lines.append(f"  ⭐ Trend line at: {status['trendline_val']}")
+        lines.append(f"  ⭐ Trend line at: {status['trendline_val']} ({status.get('trendline_dist_pct')}% away)")
+    if status.get("is_retest"):
+        lines.append(f"  ↩ Break+Retest: {status['retest_level']} — {status['retest_type']} ({status.get('bars_since_break')} bars ago)")
 
-    # SL/TP suggestion
+    # ── SL / TP ──────────────────────────────────────────────────────────────
     sl = status.get("sl")
     tp = status.get("tp")
     if sl and tp:
+        risk = abs(price - sl)
+        reward = abs(tp - price)
+        rr = f"{reward/risk:.1f}" if risk > 0 else "—"
         lines.append("")
-        lines.append("📍 <b>Suggested Levels (1:3 R:R)</b>")
-        lines.append(f"  Entry:  ~{price}")
-        lines.append(f"  SL:     {sl}  (just beyond S/R)")
-        lines.append(f"  TP:     {tp}")
+        label = "📍 <b>Suggested Levels (1:3 R:R)</b>" if is_early else "📍 <b>Trade Levels (1:3 R:R)</b>"
+        lines.append(label)
+        lines.append(f"  Entry: ~{price}")
+        lines.append(f"  SL:    {sl}  ← below swing low at S/R")
+        lines.append(f"  TP:    {tp}  ← R:R {rr}:1")
 
+    return lines
+
+
+def send_early_warning(status: dict):
+    d     = status["direction"]
+    pair  = status["pair"]
+    price = status["price"]
+    score = status["confluence_score"]
+    grade = status.get("alert_grade", "WATCH")
+    tag   = "🟢 LONG" if d == "LONG" else "🔴 SHORT"
+
+    if status.get("is_retest"):
+        header = f"⚠️ BREAK+RETEST FORMING — {tag} <b>{pair}</b>"
+    else:
+        header = f"⚠️ EARLY WARNING — {tag} <b>{pair}</b>"
+
+    lines = [
+        header,
+        f"Grade: <b>{grade}</b>   |   Price: <b>{price}</b>   |   Confluences: <b>{score}/4</b>",
+        "",
+    ]
+    lines += _build_alert_body(status, is_early=True)
     lines += [
         "",
-        "👁 Watch this pair. Wait for the missing confluence before entering.",
+        "👁 Watch this pair — wait for the missing confluence, then enter.",
         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     ]
-
     _tg_post("\n".join(lines))
 
 
@@ -140,54 +157,12 @@ def send_telegram(status: dict):
         f"Grade: <b>{grade}</b>   |   Price: <b>{price}</b>   |   Confluences: <b>{score}/4</b>",
         "",
     ]
-
-    for item in status.get("confluence_detail", []):
-        if any(kw in item for kw in ("AT ZONE", "agree", "CONFIRMED")):
-            tick = "✅"
-        elif "BONUS" in item:
-            tick = "⭐"
-        else:
-            tick = "✅"
-        lines.append(f"{tick} {item}")
-
-    # S/R map
-    above = status.get("sr_above", [])
-    below = status.get("sr_below", [])
-    pdh   = status.get("pdh")
-    pdl   = status.get("pdl")
-
-    lines.append("")
-    lines.append("📊 <b>Key Levels</b>")
-
-    if pdh:
-        lines.append(f"  PDH: {pdh}")
-    if pdl:
-        lines.append(f"  PDL: {pdl}")
-
-    if above:
-        lines.append(f"  Resistance above: {' | '.join(str(l) for l in above)}")
-    if below:
-        lines.append(f"  Support below:    {' | '.join(str(l) for l in below)}")
-
-    if status.get("at_trendline"):
-        lines.append(f"  ⭐ Trend line at: {status['trendline_val']}")
-
-    # SL/TP
-    sl = status.get("sl")
-    tp = status.get("tp")
-    if sl and tp:
-        lines.append("")
-        lines.append("📍 <b>Levels (1:3 R:R)</b>")
-        lines.append(f"  Entry:  ~{status['price']}")
-        lines.append(f"  SL:     {sl}  (just beyond S/R)")
-        lines.append(f"  TP:     {tp}")
-
+    lines += _build_alert_body(status, is_early=False)
     lines += [
         "",
-        "👉 Check fib zone on your chart. Place entry, SL, TP above.",
+        "👉 Check fib zone on your chart — place entry, SL and TP as shown above.",
         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     ]
-
     _tg_post("\n".join(lines))
 
 
