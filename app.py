@@ -292,6 +292,39 @@ def api_status():
     return jsonify(list(pair_status.values()))
 
 
+@app.route("/api/sr-levels/<pair>")
+def api_sr_levels(pair):
+    """
+    Returns all S/R data for a pair — used by Claude Code to draw levels on TradingView.
+    Daily S/R: gold solid lines (strong, 2-year lookback, pivot_n=15).
+    4H S/R:    blue dashed lines (pivot_n=12 + PDH/PDL).
+    """
+    status = pair_status.get(pair.upper())
+    if not status:
+        return jsonify({"error": f"{pair.upper()} not found — trigger a scan first"}), 404
+    return jsonify({
+        "pair":             status.get("pair"),
+        "price":            status.get("price"),
+        "direction":        status.get("direction"),
+        "alert_grade":      status.get("alert_grade"),
+        "confluence_score": status.get("confluence_score"),
+        "sr_daily":         status.get("sr_daily", []),
+        "sr_4h":            status.get("sr_4h", []),
+        "sr_above":         status.get("sr_above", []),
+        "sr_below":         status.get("sr_below", []),
+        "pdh":              status.get("pdh"),
+        "pdl":              status.get("pdl"),
+        "nearest_sr":       status.get("nearest_sr"),
+        "is_retest":        status.get("is_retest"),
+        "retest_level":     status.get("retest_level"),
+        "retest_type":      status.get("retest_type"),
+        "sl":               status.get("sl"),
+        "tp":               status.get("tp"),
+        "trendline_val":    status.get("trendline_val"),
+        "at_trendline":     status.get("at_trendline"),
+    })
+
+
 @app.route("/api/alerts")
 def api_alerts():
     return jsonify(recent_alerts)

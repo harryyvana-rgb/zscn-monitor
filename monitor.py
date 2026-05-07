@@ -151,14 +151,55 @@ def _cluster_levels(raw: list, cluster_pct: float) -> list:
             clusters.append([lvl])
     return [sum(c) / len(c) for c in clusters]
 
+def _count_touches(level: float, raw_pivots: list, cluster_pct: float) -> int:
+    """Count how many raw pivot prices are within cluster_pct% of a level."""
+    return sum(1 for p in raw_pivots if abs(p - level) / level * 100 <= cluster_pct)
+
+
+def _find_sr_levels_detailed(df_d: pd.DataFrame, df_4h: pd.DataFrame) -> dict:
+    """
+    Returns separate Daily and 4H S/R levels with strength (touch count).
+
+    Daily:  pivot_n=15 — requires 15 bars each side (strong, significant levels).
+            Using 730 days of data catches multi-year structural levels.
+    4H:     pivot_n=12 — 2 days each side for meaningful 4H structure.
+    PDH/PDL included in 4H levels.
+
+    Returns:
+        daily: list of {price, touches} sorted by price
+        h4:    list of {price, touches} sorted by price
+        all:   flat list of all unique clustered prices (for proximity checks)
+    """
+    pdh_pdl_raw = _pdh_pdl(df_d)
+
+    daily_raw = _pivot_highs(df_d, 15) + _pivot_lows(df_d, 15)
+    h4_raw    = _pivot_highs(df_4h, 12) + _pivot_lows(df_4h, 12)
+
+    daily_clustered = _cluster_levels(daily_raw, SR_CLUSTER_PCT)
+    h4_clustered    = _cluster_levels(h4_raw + pdh_pdl_raw, SR_CLUSTER_PCT)
+
+    all_raw       = daily_raw + h4_raw + pdh_pdl_raw
+    all_clustered = _cluster_levels(all_raw, SR_CLUSTER_PCT)
+
+    daily_levels = [
+        {"price": round(l, 5), "touches": _count_touches(l, daily_raw, SR_CLUSTER_PCT)}
+        for l in daily_clustered
+    ]
+    h4_levels = [
+        {"price": round(l, 5), "touches": _count_touches(l, h4_raw + pdh_pdl_raw, SR_CLUSTER_PCT)}
+        for l in h4_clustered
+    ]
+
+    return {
+        "daily": daily_levels,
+        "h4":    h4_levels,
+        "all":   [round(l, 5) for l in all_clustered],
+    }
+
+
 def _find_sr_levels(df_d: pd.DataFrame, df_4h: pd.DataFrame) -> list:
-    """Daily + 4H pivots + PDH/PDL/PWH/PWL, clustered."""
-    raw = (
-        _pivot_highs(df_d, 8) + _pivot_lows(df_d, 8) +
-        _pivot_highs(df_4h, 10) + _pivot_lows(df_4h, 10) +
-        _pdh_pdl(df_d)
-    )
-    return _cluster_levels(raw, SR_CLUSTER_PCT)
+    """Flat list of all S/R levels — used for proximity/scoring checks."""
+    return _find_sr_levels_detailed(df_d, df_4h)["all"]
 
 def _nearest_sr(price: float, levels: list) -> tuple:
     """Return (nearest_level, distance_pct) or (None, None)."""
@@ -346,6 +387,7 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         "trends_agree": False,
         "nearest_sr": None, "sr_dist_pct": None, "at_sr": False,
         "sr_above": [], "sr_below": [],
+        "sr_daily": [], "sr_4h": [],
         "pdh": None, "pdl": None,
         "trendline_val": None, "at_trendline": False, "trendline_dist_pct": None,
         "h2_trend": "RANGING", "all_trends_agree": False,
@@ -362,7 +404,7 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         # ── Fetch data ───────────────────────────────────────────────────────
         df_1h = yf.download(yf_symbol, period="59d",  interval="1h",
                             progress=False, auto_adjust=True)
-        df_d  = yf.download(yf_symbol, period="365d", interval="1d",
+        df_d  = yf.download(yf_symbol, period="730d", interval="1d",
                             progress=False, auto_adjust=True)
 
         if df_1h.empty or df_d.empty or len(df_1h) < 60 or len(df_d) < 60:
@@ -443,7 +485,8 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         status["all_trends_agree"] = all_trends_agree
 
         # ── S/R levels ───────────────────────────────────────────────────────
-        sr_levels = _find_sr_levels(df_d, df_4h)
+        sr_detail = _find_sr_levels_detailed(df_d, df_4h)
+        sr_levels = sr_detail["all"]
         nearest_sr, sr_dist = _nearest_sr(price, sr_levels)
         above, below = _levels_above_below(price, sr_levels)
 
@@ -452,6 +495,8 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         status["at_sr"]       = sr_dist is not None and sr_dist <= SR_PROXIMITY_PCT
         status["sr_above"]    = [round(l, 5) for l in above]
         status["sr_below"]    = [round(l, 5) for l in below]
+        status["sr_daily"]    = sr_detail["daily"]   # [{price, touches}, ...]
+        status["sr_4h"]       = sr_detail["h4"]      # [{price, touches}, ...]
 
         # ── Trend line (bonus) ───────────────────────────────────────────────
         tl_val = _trendline_value(df_4h, direction, pivot_n=10)
