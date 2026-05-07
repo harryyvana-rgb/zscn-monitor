@@ -59,7 +59,8 @@ def _ema(series: pd.Series, period: int = 50) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
 
 def _is_rising(s: pd.Series) -> bool:
-    return float(s.iloc[-1]) > float(s.iloc[-2])
+    # Compare 3 bars back — single-bar comparison is too noisy on resampled data
+    return float(s.iloc[-1]) > float(s.iloc[-4])
 
 
 # ── Trend structure ───────────────────────────────────────────────────────────
@@ -290,19 +291,27 @@ def _signal_candle(df_15m: pd.DataFrame, direction: str) -> tuple:
     upper_wick = h - max(o, cl)
     lower_wick = min(o, cl) - l
 
+    # Minimum meaningful wick: 0.03% of price (~3 pips on a 1.0 pair).
+    # Rejects micro-candles from thin/illiquid periods.
+    min_wick = cl * 0.0003
+
     if direction == "LONG":
-        if body > 0 and lower_wick >= 2 * body and lower_wick > upper_wick:
+        # Pin bar: long lower wick rejecting from support
+        if body > 0 and lower_wick >= 2 * body and lower_wick > upper_wick and lower_wick >= min_wick:
             quality = "HIGH" if lower_wick >= 3 * body else "MEDIUM"
             return "Pin Bar (Bullish)", quality
-        if cl > o and cl > float(prev["Open"]) and o < float(prev["Close"]):
-            # Full engulfing: close fully beyond prev open = HIGH
+        # Engulfing: bullish body fully covers previous bearish body
+        if cl > o and cl > float(prev["Open"]) and o < float(prev["Close"]) and body >= min_wick:
             quality = "HIGH" if cl >= float(prev["High"]) or o <= float(prev["Low"]) else "MEDIUM"
             return "Engulfing (Bullish)", quality
+
     elif direction == "SHORT":
-        if body > 0 and upper_wick >= 2 * body and upper_wick > lower_wick:
+        # Pin bar: long upper wick rejecting from resistance
+        if body > 0 and upper_wick >= 2 * body and upper_wick > lower_wick and upper_wick >= min_wick:
             quality = "HIGH" if upper_wick >= 3 * body else "MEDIUM"
             return "Pin Bar (Bearish)", quality
-        if cl < o and cl < float(prev["Open"]) and o > float(prev["Close"]):
+        # Engulfing: bearish body fully covers previous bullish body
+        if cl < o and cl < float(prev["Open"]) and o > float(prev["Close"]) and body >= min_wick:
             quality = "HIGH" if cl <= float(prev["Low"]) or o >= float(prev["High"]) else "MEDIUM"
             return "Engulfing (Bearish)", quality
 
@@ -624,7 +633,11 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
             direction    = status.get("direction", "NONE")
             score        = status.get("confluence_score", 0)
 
+            # Hard requirements: EMA aligned AND Daily+4H trends agree.
+            # If either fails there is NO setup — Harry's strategy requires both.
             if not status.get("ema_aligned") or direction == "NONE":
+                continue
+            if not status.get("trends_agree"):
                 continue
 
             cooldown_key = f"{name}_{direction}"
@@ -637,7 +650,6 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
                     logger.info(f"[{name}] {direction} - full cooldown active, skipping")
                     continue
                 alert_cooldown[cooldown_key] = now
-                # reset early cooldown so it won't spam after a full alert fires
                 early_alert_cooldown.pop(early_key, None)
                 alert = {**status, "received_at": now.strftime("%Y-%m-%d %H:%M UTC")}
                 recent_alerts.insert(0, alert)
@@ -647,7 +659,13 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
                 logger.info(f"[{name}] {direction} - 4/4 - FULL ALERT sent")
 
             # ── Early warning (3/4) ──────────────────────────────────────────
+            # Only fire when price is within 1.0% of an S/R zone — otherwise
+            # there is no zone to trade from and it's not an actionable setup.
             elif score == 3 and send_early_warning_fn is not None:
+                sr_dist = status.get("sr_dist_pct")
+                if sr_dist is None or sr_dist > 1.0:
+                    logger.info(f"[{name}] {direction} - 3/4 but price {sr_dist}% from S/R, skipping")
+                    continue
                 last_early = early_alert_cooldown.get(early_key)
                 if last_early and (now - last_early) < timedelta(hours=ALERT_COOLDOWN_HOURS):
                     logger.info(f"[{name}] {direction} - early cooldown active, skipping")
@@ -658,7 +676,7 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
                 if len(recent_alerts) > 100:
                     recent_alerts.pop()
                 send_early_warning_fn(status)
-                logger.info(f"[{name}] {direction} - 3/4 - early warning sent")
+                logger.info(f"[{name}] {direction} - 3/4 (sr_dist {sr_dist}%) - early warning sent")
 
     logger.info(f"=== Scan complete. {len(results)} pairs checked ===")
 
