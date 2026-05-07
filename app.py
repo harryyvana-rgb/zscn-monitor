@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, render_template, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from monitor import run_scan, run_weekly_bias, pair_status, recent_alerts
+from monitor import run_scan, run_weekly_bias, run_friday_preview, pair_status, recent_alerts
 
 last_scan_time = None
 
@@ -207,6 +207,116 @@ def send_weekly_bias(ready: list, watch: list, early: list):
     _tg_post("\n".join(lines))
 
 
+def send_friday_preview(hot: list, building: list, watching: list, early: list):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    lines = [
+        f"📅 <b>ZSCN Friday Preview — Next Week — {now}</b>",
+        "Here's what to watch when the market reopens Sunday.",
+        "",
+    ]
+
+    if hot:
+        lines.append("🔥 <b>AT THE ZONE — could trigger next week</b>")
+        lines.append("  (EMA + trend aligned + price within 1% of S/R)")
+        for s in hot:
+            tag  = "🟢" if s["direction"] == "LONG" else "🔴"
+            dist = s.get("sr_dist_pct", "?")
+            nr   = s.get("nearest_sr", "")
+            sl   = s.get("sl")
+            tp   = s.get("tp")
+            line = f"  {tag} <b>{s['pair']}</b> @ {s['price']}  →  {dist}% from S/R {nr}"
+            if sl and tp:
+                line += f"  |  SL {sl} / TP {tp}"
+            lines.append(line)
+        lines.append("")
+
+    if building:
+        lines.append("📈 <b>BUILDING UP — approaching zone (1–3% away)</b>")
+        for s in building:
+            tag  = "🟢" if s["direction"] == "LONG" else "🔴"
+            dist = s.get("sr_dist_pct", "?")
+            nr   = s.get("nearest_sr", "")
+            lines.append(f"  {tag} {s['pair']} @ {s['price']}  →  {dist}% from S/R {nr}")
+        lines.append("")
+
+    if watching:
+        lines.append("👀 <b>WATCHING — trend aligned but far from zone (&gt;3%)</b>")
+        longs  = [s["pair"] for s in watching if s["direction"] == "LONG"]
+        shorts = [s["pair"] for s in watching if s["direction"] == "SHORT"]
+        if longs:
+            lines.append(f"  🟢 Bullish: {', '.join(longs)}")
+        if shorts:
+            lines.append(f"  🔴 Bearish: {', '.join(shorts)}")
+        lines.append("")
+
+    if early:
+        lines.append("📌 <b>EARLY STAGE — EMA aligned, structure still forming</b>")
+        longs  = [s["pair"] for s in early if s["direction"] == "LONG"]
+        shorts = [s["pair"] for s in early if s["direction"] == "SHORT"]
+        if longs:
+            lines.append(f"  Bullish: {', '.join(longs)}")
+        if shorts:
+            lines.append(f"  Bearish: {', '.join(shorts)}")
+        lines.append("")
+
+    if not hot and not building and not watching and not early:
+        lines.append("No aligned pairs. Market is choppy — enjoy the weekend, stay out.")
+
+    lines.append("Have a good weekend. Only trade the 4/4 setups. 💪")
+    _tg_post("\n".join(lines))
+
+
+def send_week_opener(ready: list, watch: list, early: list):
+    """Sunday 22:00 UTC — market just opened. Urgent version of weekly bias."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    lines = [
+        f"🗓 <b>WEEK OPENER — Market Just Opened — {now}</b>",
+        "Here's what's live right now as the new week begins.",
+        "",
+    ]
+
+    if ready:
+        lines.append("🔥 <b>READY TO ENTER NOW (4/4)</b>")
+        lines.append("  Fib zone is yours — confirm entry on 15M.")
+        for s in ready:
+            tag   = "🟢" if s["direction"] == "LONG" else "🔴"
+            grade = s.get("alert_grade", "A")
+            sl    = s.get("sl")
+            tp    = s.get("tp")
+            line  = f"  {tag} <b>{s['pair']}</b> @ {s['price']}  Grade {grade}"
+            if sl and tp:
+                line += f"  |  SL {sl} / TP {tp}"
+            lines.append(line)
+        lines.append("")
+
+    if watch:
+        lines.append("👀 <b>WATCH THIS WEEK — EMA + trend ready, approaching zone</b>")
+        for s in watch:
+            tag   = "🟢" if s["direction"] == "LONG" else "🔴"
+            score = s.get("confluence_score", 0)
+            dist  = s.get("sr_dist_pct")
+            nr    = s.get("nearest_sr", "")
+            dist_str = f"  {dist}% from S/R {nr}" if dist else ""
+            lines.append(f"  {tag} {s['pair']} {score}/4{dist_str}")
+        lines.append("")
+
+    if early:
+        lines.append("📌 <b>EARLY STAGE — EMA aligned, structure pending</b>")
+        longs  = [s["pair"] for s in early if s["direction"] == "LONG"]
+        shorts = [s["pair"] for s in early if s["direction"] == "SHORT"]
+        if longs:
+            lines.append(f"  🟢 Bullish: {', '.join(longs)}")
+        if shorts:
+            lines.append(f"  🔴 Bearish: {', '.join(shorts)}")
+        lines.append("")
+
+    if not ready and not watch and not early:
+        lines.append("No aligned pairs at open. Market may be choppy — be patient.")
+
+    lines.append("Trade well this week. Only take the 4/4. 💪")
+    _tg_post("\n".join(lines))
+
+
 def scheduled_scan():
     global last_scan_time
     try:
@@ -223,13 +333,38 @@ def scheduled_weekly_bias():
         logger.exception(f"Weekly bias error: {e}")
 
 
-# Continuous scan every 30 min around the clock (no session restriction)
-# Weekly bias: Sunday 11:00 UTC (6:00 AM CDT)
+def scheduled_week_opener():
+    try:
+        run_weekly_bias(send_week_opener)
+    except Exception as e:
+        logger.exception(f"Week opener error: {e}")
+
+
+def scheduled_friday_preview():
+    try:
+        run_friday_preview(send_friday_preview)
+    except Exception as e:
+        logger.exception(f"Friday preview error: {e}")
+
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+# Continuous scan every 30 min (no session restriction)
+# Sunday 11:00 UTC (6:00 AM CDT)  — morning preparation bias
+# Sunday 22:00 UTC (5:00 PM CDT)  — market open confirmation
+# Friday 20:00 UTC (3:00 PM CDT)  — end-of-week preview for next week
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(scheduled_scan,        "interval", minutes=30, id="continuous_scan")
-scheduler.add_job(scheduled_weekly_bias, "cron", day_of_week="sun", hour=11, minute=0, id="weekly_bias")
+scheduler.add_job(scheduled_scan,           "interval", minutes=30, id="continuous_scan")
+scheduler.add_job(scheduled_weekly_bias,    "cron", day_of_week="sun", hour=11, minute=0,  id="weekly_bias")
+scheduler.add_job(scheduled_week_opener,    "cron", day_of_week="sun", hour=22, minute=0,  id="week_opener")
+scheduler.add_job(scheduled_friday_preview, "cron", day_of_week="fri", hour=20, minute=0,  id="friday_preview")
 scheduler.start()
-logger.info("Scheduler started — every 30 min continuous | Sunday 11:00 UTC weekly bias")
+logger.info(
+    "Scheduler started — "
+    "every 30 min | "
+    "Sun 11:00 UTC (bias) | "
+    "Sun 22:00 UTC (week opener) | "
+    "Fri 20:00 UTC (Friday preview)"
+)
 
 
 @app.route("/")
@@ -315,6 +450,18 @@ def trigger_scan():
 def trigger_weekly():
     threading.Thread(target=scheduled_weekly_bias, daemon=True).start()
     return jsonify({"ok": True, "message": "Weekly bias triggered"})
+
+
+@app.route("/trigger-friday", methods=["POST"])
+def trigger_friday():
+    threading.Thread(target=scheduled_friday_preview, daemon=True).start()
+    return jsonify({"ok": True, "message": "Friday preview triggered"})
+
+
+@app.route("/trigger-week-opener", methods=["POST"])
+def trigger_week_opener():
+    threading.Thread(target=scheduled_week_opener, daemon=True).start()
+    return jsonify({"ok": True, "message": "Week opener triggered"})
 
 
 if __name__ == "__main__":

@@ -717,3 +717,57 @@ def run_weekly_bias(send_weekly_fn):
 
     send_weekly_fn(ready, watch, early)
     logger.info(f"=== Weekly bias complete. Ready={len(ready)} Watch={len(watch)} Early={len(early)} ===")
+
+
+# ── Friday end-of-week preview ────────────────────────────────────────────────
+def run_friday_preview(send_friday_fn):
+    """
+    Friday scan. Ranks all 28 pairs by proximity to S/R zone so Harry knows
+    exactly what to watch the following week.
+
+    Categories (EMA + trend must agree for all of them):
+      hot      — price within 1.0% of a key S/R zone — could trigger next week
+      building — 1.0–3.0% away — structure building, approaching the zone
+      watching — >3% from zone — trend aligned but too far, keep on radar
+      early    — EMA aligned only, trend not yet confirmed
+    """
+    logger.info("=== Friday preview scan started ===")
+    results = {}
+    threads = []
+
+    def worker(name, yf_sym):
+        results[name] = _check_pair(name, yf_sym)
+
+    for name, yf_sym in PAIRS.items():
+        t = threading.Thread(target=worker, args=(name, yf_sym))
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join(timeout=45)
+
+    with _lock:
+        for name, status in results.items():
+            pair_status[name] = status
+
+    def sr_sort_key(s):
+        d = s.get("sr_dist_pct")
+        return d if d is not None else 999.0
+
+    aligned = sorted(
+        [s for s in results.values() if s.get("ema_aligned") and s.get("trends_agree")],
+        key=sr_sort_key,
+    )
+
+    hot      = [s for s in aligned if (s.get("sr_dist_pct") or 999) <= 1.0]
+    building = [s for s in aligned if 1.0 < (s.get("sr_dist_pct") or 999) <= 3.0]
+    watching = [s for s in aligned if (s.get("sr_dist_pct") or 999) > 3.0]
+    early    = [s for s in results.values()
+                if s.get("ema_aligned") and not s.get("trends_agree")]
+
+    send_friday_fn(hot, building, watching, early)
+    logger.info(
+        f"=== Friday preview complete. "
+        f"Hot={len(hot)} Building={len(building)} "
+        f"Watching={len(watching)} Early={len(early)} ==="
+    )
