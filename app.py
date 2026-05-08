@@ -8,7 +8,8 @@ from flask import Flask, render_template, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from monitor import (run_scan, run_weekly_bias, run_friday_preview,
-                     pair_status, recent_alerts, ALERTS_LOG_PATH)
+                     pair_status, recent_alerts, ALERTS_LOG_PATH,
+                     get_win_rate, get_market_update_data)
 
 last_scan_time = None
 
@@ -160,20 +161,31 @@ def _build_alert_body(status: dict, is_early: bool) -> list:
     if status.get("is_retest"):
         lines.append(f"  ↩ Break+Retest: {status['retest_level']} — {status['retest_type']} ({status.get('bars_since_break')} bars ago)")
 
-    # ── SL / TP ──────────────────────────────────────────────────────────────
-    sl = status.get("sl")
-    tp = status.get("tp")
-    if sl and tp:
-        risk   = abs(price - sl)
-        reward = abs(tp - price)
-        rr     = f"{reward/risk:.1f}" if risk > 0 else "—"
+    # ── SL / TP — only shown on HIGH conviction (HIGH quality signal, not early) ─
+    sl  = status.get("sl")
+    tp  = status.get("tp")
+    sig = status.get("signal_quality", "None")
+    show_levels = sl and tp and not is_early and sig == "HIGH"
+
+    if show_levels:
+        risk     = abs(price - sl)
+        reward   = abs(tp - price)
+        rr       = f"{reward/risk:.1f}" if risk > 0 else "—"
         sl_label = "below swing low at S/R" if d == "LONG" else "above swing high at S/R"
         lines.append("")
-        label = "📍 <b>Suggested Levels (1:3 R:R)</b>" if is_early else "📍 <b>Trade Levels (1:3 R:R)</b>"
-        lines.append(label)
+        lines.append("📍 <b>Trade Levels (1:3 R:R)</b>")
         lines.append(f"  Entry: ~{price}")
         lines.append(f"  SL:    {sl}  ← {sl_label}")
         lines.append(f"  TP:    {tp}  ← R:R {rr}:1")
+    elif sl and tp and not is_early and sig != "HIGH":
+        lines.append("")
+        lines.append(f"⚠️ Signal candle quality is MEDIUM — wait for a stronger rejection before entering.")
+        lines.append(f"  Estimated levels when confirmed: SL ~{sl}  /  TP ~{tp}")
+    elif is_early:
+        if sl and tp:
+            lines.append("")
+            lines.append(f"📍 <b>Suggested Levels (once signal confirms)</b>")
+            lines.append(f"  Entry: ~{price}   SL: ~{sl}   TP: ~{tp}")
 
     return lines
 
@@ -274,6 +286,10 @@ def send_weekly_bias(ready: list, watch: list, early: list):
 
     if not ready and not watch and not early:
         lines.append("No aligned pairs found. Market is choppy — stay patient.")
+
+    wr = get_win_rate()
+    if wr["total"] >= 3:
+        lines.append(f"📊 Scanner record: {wr['wins']}W / {wr['losses']}L ({wr['win_rate']}% win rate, {wr['total']} tracked)")
 
     lines.append("Good luck this week. Only trade the 4/4 setups. 💪")
     _tg_post("\n".join(lines))
@@ -389,13 +405,95 @@ def send_week_opener(ready: list, watch: list, early: list):
     _tg_post("\n".join(lines))
 
 
+def send_invalidation_alert(trade: dict, status: dict, reason: str):
+    d    = trade["direction"]
+    pair = trade["pair"]
+    tag  = "🟢 LONG" if d == "LONG" else "🔴 SHORT"
+    entry = trade.get("entry_price", "?")
+    price = status.get("price", "?")
+
+    lines = [
+        f"⚠️ SETUP INVALIDATING — {tag} <b>{pair}</b>",
+        f"Entry was: <b>{entry}</b>  |  Current price: <b>{price}</b>",
+        "",
+        f"❌ {reason}",
+        "",
+        "Do <b>NOT</b> enter this trade. If already in, review your SL immediately.",
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    ]
+    _tg_post("\n".join(lines))
+
+
+def send_market_update(update_data: dict):
+    at_zone    = update_data.get("at_zone", [])
+    approaching = update_data.get("approaching", [])
+    trending   = update_data.get("trending", [])
+
+    if not at_zone and not approaching and not trending:
+        return  # nothing to report
+
+    now = datetime.now(timezone.utc)
+    session = "London" if now.hour < 12 else "New York"
+
+    lines = [
+        f"📡 <b>ZSCN Market Update — {session} Session — {now.strftime('%Y-%m-%d %H:%M UTC')}</b>",
+        "",
+    ]
+
+    if at_zone:
+        lines.append("🎯 <b>AT THE ZONE — waiting for 15M signal</b>")
+        for s in at_zone:
+            tag   = "🟢" if s["direction"] == "LONG" else "🔴"
+            adx   = s.get("adx_4h", "?")
+            lines.append(f"  {tag} <b>{s['pair']}</b> @ {s['price']}  |  ADX {adx}  |  S/R {s.get('nearest_sr', '?')}")
+        lines.append("")
+
+    if approaching:
+        lines.append("📈 <b>APPROACHING ZONE — building up (within 1.5%)</b>")
+        for s in approaching:
+            tag  = "🟢" if s["direction"] == "LONG" else "🔴"
+            dist = s.get("sr_dist_pct", "?")
+            nr   = s.get("nearest_sr", "?")
+            lines.append(f"  {tag} {s['pair']} @ {s['price']}  |  {dist}% from {nr}")
+        lines.append("")
+
+    if trending:
+        lines.append("👀 <b>TRENDING — clean setup, far from zone</b>")
+        longs  = [s["pair"] for s in trending if s["direction"] == "LONG"]
+        shorts = [s["pair"] for s in trending if s["direction"] == "SHORT"]
+        if longs:
+            lines.append(f"  🟢 {', '.join(longs)}")
+        if shorts:
+            lines.append(f"  🔴 {', '.join(shorts)}")
+        lines.append("")
+
+    lines.append("No action needed yet — monitoring continues every 30 min.")
+    _tg_post("\n".join(lines))
+
+
 def scheduled_scan():
     global last_scan_time
     try:
-        run_scan(send_telegram, send_early_warning)
+        invalidated, results = run_scan(send_telegram, send_early_warning)
         last_scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        # Send invalidation alerts
+        for trade, status, reason in invalidated:
+            send_invalidation_alert(trade, status, reason)
+
     except Exception as e:
         logger.exception(f"Scan error: {e}")
+
+
+def scheduled_market_update():
+    try:
+        from monitor import pair_status as ps
+        if not ps:
+            return
+        data = get_market_update_data(dict(ps))
+        send_market_update(data)
+    except Exception as e:
+        logger.exception(f"Market update error: {e}")
 
 
 def scheduled_weekly_bias():
@@ -426,6 +524,8 @@ def scheduled_friday_preview():
 # Friday 20:00 UTC (3:00 PM CDT)  — end-of-week preview for next week
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(scheduled_scan,           "interval", minutes=30, id="continuous_scan")
+scheduler.add_job(scheduled_market_update,  "cron", hour=6,  minute=0,  id="london_update")
+scheduler.add_job(scheduled_market_update,  "cron", hour=13, minute=0,  id="ny_update")
 scheduler.add_job(scheduled_weekly_bias,    "cron", day_of_week="sun", hour=11, minute=0,  id="weekly_bias")
 scheduler.add_job(scheduled_week_opener,    "cron", day_of_week="sun", hour=22, minute=0,  id="week_opener")
 scheduler.add_job(scheduled_friday_preview, "cron", day_of_week="fri", hour=20, minute=0,  id="friday_preview")
@@ -433,6 +533,8 @@ scheduler.start()
 logger.info(
     "Scheduler started — "
     "every 30 min | "
+    "06:00 UTC (London update) | "
+    "13:00 UTC (NY update) | "
     "Sun 11:00 UTC (bias) | "
     "Sun 22:00 UTC (week opener) | "
     "Fri 20:00 UTC (Friday preview)"

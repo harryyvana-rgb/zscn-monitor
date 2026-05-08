@@ -27,6 +27,7 @@ from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 import yfinance as yf
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,223 @@ def _save_alerts_to_disk(alerts: list):
             json.dump(alerts[:_MAX_STORED_ALERTS], f, default=str, indent=2)
     except Exception as e:
         logger.warning(f"Could not save alerts to disk: {e}")
+
+
+# ── Outcome tracking (self-learning foundation) ───────────────────────────────
+OUTCOMES_LOG_PATH = os.path.join(os.path.dirname(__file__), "data", "trade_outcomes.json")
+
+def _load_outcomes() -> list:
+    try:
+        if os.path.exists(OUTCOMES_LOG_PATH):
+            with open(OUTCOMES_LOG_PATH, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Could not load outcomes: {e}")
+    return []
+
+def _save_outcomes(outcomes: list):
+    try:
+        os.makedirs(os.path.dirname(OUTCOMES_LOG_PATH), exist_ok=True)
+        with open(OUTCOMES_LOG_PATH, "w") as f:
+            json.dump(outcomes[:1000], f, default=str, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not save outcomes: {e}")
+
+trade_outcomes = _load_outcomes()
+
+def get_win_rate() -> dict:
+    wins   = sum(1 for o in trade_outcomes if o.get("result") == "WIN")
+    losses = sum(1 for o in trade_outcomes if o.get("result") == "LOSS")
+    total  = wins + losses
+    return {"wins": wins, "losses": losses, "total": total,
+            "win_rate": round(wins / total * 100, 1) if total > 0 else None}
+
+def update_trade_outcomes(pair_results: dict):
+    """Check all pending alerts for TP/SL hits and update records."""
+    global trade_outcomes
+    updated = False
+    now = datetime.now(timezone.utc)
+
+    for outcome in trade_outcomes:
+        if outcome.get("result") not in (None, "pending"):
+            continue
+        pair, direction, sl, tp = (outcome.get(k) for k in ("pair", "direction", "sl", "tp"))
+        if not all([pair, direction, sl, tp]):
+            continue
+        try:
+            fired = datetime.fromisoformat(outcome.get("fired_at", "").replace(" UTC", "+00:00"))
+            if (now - fired).total_seconds() > 7 * 24 * 3600:
+                outcome["result"] = "expired"
+                updated = True
+                continue
+        except Exception:
+            pass
+        status = pair_results.get(pair)
+        if not status or not status.get("price"):
+            continue
+        price = status["price"]
+        if direction == "LONG":
+            if price >= tp:
+                outcome["result"] = "WIN";  outcome["result_at"] = now.strftime("%Y-%m-%d %H:%M UTC"); updated = True
+            elif price <= sl:
+                outcome["result"] = "LOSS"; outcome["result_at"] = now.strftime("%Y-%m-%d %H:%M UTC"); updated = True
+        elif direction == "SHORT":
+            if price <= tp:
+                outcome["result"] = "WIN";  outcome["result_at"] = now.strftime("%Y-%m-%d %H:%M UTC"); updated = True
+            elif price >= sl:
+                outcome["result"] = "LOSS"; outcome["result_at"] = now.strftime("%Y-%m-%d %H:%M UTC"); updated = True
+
+    if updated:
+        _save_outcomes(trade_outcomes)
+
+
+# ── Trend quality — ADX + consolidation ──────────────────────────────────────
+def _adx(df: pd.DataFrame, period: int = 14) -> float | None:
+    """ADX on OHLC data. <20 = ranging/choppy, 20-30 = trending, >30 = strong."""
+    if len(df) < period * 3:
+        return None
+    try:
+        h, l, c = df["High"], df["Low"], df["Close"]
+        tr = pd.concat([h - l, (h - c.shift(1)).abs(), (l - c.shift(1)).abs()], axis=1).max(axis=1)
+        up, down = h.diff(), -l.diff()
+        plus_dm  = up.where((up > down) & (up > 0), 0.0)
+        minus_dm = down.where((down > up) & (down > 0), 0.0)
+        com = period - 1
+        atr    = tr.ewm(com=com, adjust=False).mean()
+        sm_pdm = plus_dm.ewm(com=com, adjust=False).mean()
+        sm_ndm = minus_dm.ewm(com=com, adjust=False).mean()
+        di_p   = 100 * sm_pdm / atr.replace(0, float("nan"))
+        di_m   = 100 * sm_ndm / atr.replace(0, float("nan"))
+        dx     = 100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, float("nan"))
+        adx    = dx.ewm(com=com, adjust=False).mean()
+        val    = float(adx.iloc[-1])
+        return None if np.isnan(val) else val
+    except Exception:
+        return None
+
+def _is_consolidating(df: pd.DataFrame, lookback: int = 20, threshold_pct: float = 1.5) -> bool:
+    """True if price has been in a tight range — choppy, no directional move."""
+    if len(df) < lookback:
+        return False
+    recent = df.iloc[-lookback:]
+    rng = float(recent["High"].max() - recent["Low"].min())
+    mid = float(recent["Close"].mean())
+    return (rng / mid * 100) < threshold_pct
+
+
+# ── Active trade tracker (invalidation alerts) ───────────────────────────────
+_active_trades: dict = {}
+_active_trades_lock  = threading.Lock()
+
+def _register_active_trade(name: str, direction: str, status: dict):
+    key = f"{name}_{direction}"
+    with _active_trades_lock:
+        _active_trades[key] = {
+            "pair": name, "direction": direction,
+            "entry_price": status.get("price"),
+            "sl":          status.get("sl"),
+            "tp":          status.get("tp"),
+            "sr_level":    status.get("nearest_sr"),
+            "grade":       status.get("alert_grade"),
+            "fired_at":    datetime.now(timezone.utc).isoformat(),
+        }
+    logger.info(f"[{name}] Registered as active trade @ {status.get('price')}")
+
+def check_invalidations(pair_results: dict) -> list:
+    """
+    Returns list of (trade, status, reason) for setups that are now failing.
+    Clears those trades from the active tracker.
+    """
+    invalidated = []
+    now = datetime.now(timezone.utc)
+
+    with _active_trades_lock:
+        to_remove = []
+        for key, trade in list(_active_trades.items()):
+            pair, direction = trade["pair"], trade["direction"]
+            try:
+                fired = datetime.fromisoformat(trade.get("fired_at", ""))
+                if (now - fired).total_seconds() > 48 * 3600:
+                    logger.info(f"[{pair}] Active trade expired 48h")
+                    to_remove.append(key)
+                    continue
+            except Exception:
+                pass
+            status = pair_results.get(pair)
+            if not status or not status.get("price"):
+                continue
+            price, sl, sr = status["price"], trade.get("sl"), trade.get("sr_level")
+            reason = None
+
+            if sl:
+                if direction == "LONG"  and price <= sl:
+                    reason = f"SL level {sl} reached — setup stopped out"
+                elif direction == "SHORT" and price >= sl:
+                    reason = f"SL level {sl} reached — setup stopped out"
+
+            if not reason and sr:
+                if direction == "LONG"  and price < sr * 0.997:
+                    reason = f"Support zone {sr} broken — price closed back below"
+                elif direction == "SHORT" and price > sr * 1.003:
+                    reason = f"Resistance zone {sr} broken — price closed back above"
+
+            if not reason and not status.get("ema_aligned"):
+                reason = "EMA 50 alignment lost — price crossed back through EMA"
+
+            if not reason:
+                curr_dir = status.get("direction", "NONE")
+                if curr_dir not in (direction, "NONE"):
+                    reason = f"EMA flipped to {curr_dir} — original {direction} bias no longer valid"
+
+            if not reason:
+                d_tr, h4_tr = status.get("daily_trend", ""), status.get("h4_trend", "")
+                if direction == "LONG"  and (d_tr == "BEARISH" or h4_tr == "BEARISH"):
+                    reason = f"Trend structure broke — Daily:{d_tr} / 4H:{h4_tr}"
+                elif direction == "SHORT" and (d_tr == "BULLISH" or h4_tr == "BULLISH"):
+                    reason = f"Trend structure broke — Daily:{d_tr} / 4H:{h4_tr}"
+
+            if reason:
+                invalidated.append((trade, status, reason))
+                to_remove.append(key)
+                logger.info(f"[{pair}] Invalidated: {reason}")
+
+        for key in to_remove:
+            _active_trades.pop(key, None)
+
+    return invalidated
+
+
+# ── Market update helper ──────────────────────────────────────────────────────
+def get_market_update_data(pair_results: dict) -> dict:
+    """Categorise pairs for a market status briefing (not entry signals)."""
+    at_zone     = []
+    approaching = []
+    trending    = []
+
+    for status in pair_results.values():
+        if not status.get("ema_aligned") or not status.get("trends_agree"):
+            continue
+        if not status.get("is_trending", True):
+            continue
+        if status.get("confluence_score", 0) >= 4:
+            continue  # already fired
+
+        sr_dist = status.get("sr_dist_pct")
+        if status.get("at_sr"):
+            at_zone.append(status)
+        elif sr_dist is not None and sr_dist <= 1.5:
+            approaching.append(status)
+        else:
+            trending.append(status)
+
+    def by_dist(s):
+        return s.get("sr_dist_pct") or 999
+
+    at_zone.sort(key=by_dist)
+    approaching.sort(key=by_dist)
+    trending.sort(key=by_dist)
+
+    return {"at_zone": at_zone[:4], "approaching": approaching[:5], "trending": trending[:5]}
 
 PAIRS = {
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "AUDUSD": "AUDUSD=X",
@@ -582,6 +800,20 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         else:
             detail.append("15M signal: none yet")
 
+        # ── Trend quality (ADX + consolidation) ─────────────────────────────
+        adx_val = _adx(df_4h)
+        consolidating = _is_consolidating(df_4h)
+        is_trending   = (adx_val is not None and adx_val >= 20) and not consolidating
+        trend_strength = (
+            "STRONG"   if adx_val and adx_val >= 30 else
+            "MODERATE" if adx_val and adx_val >= 20 else
+            "WEAK"
+        )
+        status["adx_4h"]         = round(adx_val, 1) if adx_val is not None else None
+        status["is_trending"]    = is_trending
+        status["trend_strength"] = trend_strength
+        status["consolidating"]  = consolidating
+
         status["confluence_score"]  = score
         status["confluence_detail"] = detail
         status["alert"]        = score >= 4
@@ -651,6 +883,11 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
 
     now = datetime.now(timezone.utc)
 
+    # Check outcomes and invalidations against latest results
+    update_trade_outcomes(results)
+    invalidated = check_invalidations(results)
+    # Caller (app.py) handles sending invalidation messages
+
     with _lock:
         for name, status in results.items():
             pair_status[name] = status
@@ -658,10 +895,15 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
             score        = status.get("confluence_score", 0)
 
             # Hard requirements: EMA aligned AND Daily+4H trends agree.
-            # If either fails there is NO setup — Harry's strategy requires both.
             if not status.get("ema_aligned") or direction == "NONE":
                 continue
             if not status.get("trends_agree"):
+                continue
+
+            # Quality gate: skip choppy/ranging markets
+            if not status.get("is_trending", True):
+                adx = status.get("adx_4h", "?")
+                logger.info(f"[{name}] {direction} - ADX {adx} < 20 (choppy), skipping")
                 continue
 
             cooldown_key = f"{name}_{direction}"
@@ -680,6 +922,19 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
                 if len(recent_alerts) > 100:
                     recent_alerts.pop()
                 _save_alerts_to_disk(recent_alerts)
+                # Log for outcome tracking
+                trade_outcomes.insert(0, {
+                    "pair": name, "direction": direction,
+                    "entry_price": status.get("price"),
+                    "sl":          status.get("sl"),
+                    "tp":          status.get("tp"),
+                    "grade":       status.get("alert_grade"),
+                    "adx":         status.get("adx_4h"),
+                    "fired_at":    now.strftime("%Y-%m-%d %H:%M UTC"),
+                    "result":      "pending",
+                })
+                _save_outcomes(trade_outcomes)
+                _register_active_trade(name, direction, status)
                 send_telegram_fn(status)
                 logger.info(f"[{name}] {direction} - 4/4 - FULL ALERT sent")
 
@@ -705,9 +960,10 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
                     recent_alerts.pop()
                 _save_alerts_to_disk(recent_alerts)
                 send_early_warning_fn(status)
-                logger.info(f"[{name}] {direction} - 3/4 (sr_dist {sr_dist}%) - early warning sent")
+                logger.info(f"[{name}] {direction} - 3/4 at zone - early warning sent")
 
     logger.info(f"=== Scan complete. {len(results)} pairs checked ===")
+    return invalidated, results
 
 
 # ── Weekly bias scan (Sundays) ────────────────────────────────────────────────
