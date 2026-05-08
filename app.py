@@ -37,7 +37,6 @@ def _tg_post(msg: str):
 
 
 def _confluence_tick(item: str) -> str:
-    """Assign the correct tick icon to a confluence detail line."""
     if "BONUS" in item:
         return "⭐"
     if any(kw in item for kw in ("partial", "not at zone", "none yet", "diverges")):
@@ -45,36 +44,100 @@ def _confluence_tick(item: str) -> str:
     return "✅"
 
 
+def _setup_narrative(status: dict) -> str:
+    """One unique sentence describing what makes this specific setup stand out."""
+    d    = status["direction"]
+    bias = "bullish" if d == "LONG" else "bearish"
+
+    if status.get("is_retest"):
+        rtype = status.get("retest_type", "")
+        noun  = "old resistance reclaimed as support" if "Resistance" in rtype else "old support flipped to resistance"
+        bars  = status.get("bars_since_break", "?")
+        return f"{noun.capitalize()} — structural role reversal ({bars} bars since break)."
+
+    if status.get("at_trendline") and status.get("at_sr"):
+        tl = status.get("trendline_val", "")
+        return f"Diagonal trend line ({tl}) coincides with horizontal S/R — rare dual-confluence zone."
+
+    if status.get("all_trends_agree"):
+        h2 = status.get("h2_trend", "").capitalize()
+        return f"Daily + 4H + 2H all {bias} ({h2}) — maximum trend alignment on this pair."
+
+    sig_quality = status.get("signal_quality", "None")
+    sig_type    = status.get("signal_15m", "")
+    if sig_quality == "HIGH" and sig_type != "None":
+        action = "rejection from support" if d == "LONG" else "rejection from resistance"
+        return f"Aggressive {sig_type.lower()} — strong {action}, wick dominates the candle."
+
+    # Highlight S/R touch count if notable
+    nearest = status.get("nearest_sr")
+    if nearest:
+        for lvl in status.get("sr_daily", []):
+            if abs(lvl["price"] - nearest) / nearest * 100 < 0.25 and lvl.get("touches", 0) >= 3:
+                return f"Daily S/R zone with {lvl['touches']} historical touches — heavily respected level."
+
+    sr_dist = status.get("sr_dist_pct")
+    nr      = status.get("nearest_sr")
+    if nr and sr_dist is not None:
+        return f"Price at {nr} ({sr_dist}% from zone) — all required {bias} confluences met."
+
+    return f"All required {bias} confluences stack on this pair."
+
+
+def _closing_cta(status: dict, is_early: bool) -> str:
+    """Varied call-to-action based on grade, signal quality, and setup type."""
+    grade       = status.get("alert_grade", "A")
+    sig_quality = status.get("signal_quality", "None")
+    d           = status["direction"]
+
+    if is_early:
+        nr = status.get("nearest_sr", "the zone")
+        return f"🕐 Price is AT {nr} — watch 15M for a clean pin bar or engulfing before entering."
+
+    if grade == "A+":
+        return "🔥 Highest conviction. Draw your fib — if 50% or 61.8% lands here, this is your entry."
+
+    if sig_quality == "HIGH":
+        return "👉 Strong rejection candle confirms the zone. Map fib, place entry, SL and TP."
+
+    if sig_quality == "MEDIUM":
+        return "👉 Setup is valid — signal candle is moderate quality. Confirm fib alignment before entering."
+
+    return "👉 All confluences met. Check fib zone on chart, then place entry, SL and TP."
+
+
 def _build_alert_body(status: dict, is_early: bool) -> list:
-    """
-    Shared body for both full alerts and early warnings.
-    Both send identical information — early warning adds a 'Waiting for' line.
-    """
     lines = []
     price = status["price"]
     d     = status["direction"]
 
-    # ── Confluence checklist ─────────────────────────────────────────────────
-    for item in status.get("confluence_detail", []):
+    # ── Core confluences (first 4 items = scored) ────────────────────────────
+    detail      = status.get("confluence_detail", [])
+    core_items  = detail[:4]
+    extra_items = detail[4:]
+
+    for item in core_items:
         lines.append(f"{_confluence_tick(item)} {item}")
 
     # ── What's still missing (early warning only) ────────────────────────────
-    if is_early:
-        missing = []
-        if not status.get("trends_agree"):
-            missing.append("trend structure — Daily + 4H not both aligned yet")
-        if not status.get("at_sr"):
-            dist    = status.get("sr_dist_pct")
-            nearest = status.get("nearest_sr")
-            if nearest and dist:
-                missing.append(f"S/R zone — {dist}% away from {nearest}, not there yet")
-            else:
-                missing.append("S/R zone — not identified yet")
-        if not status.get("has_signal"):
-            missing.append("15M signal candle — watch for pin bar or engulfing at the zone")
-        if missing:
-            lines.append("")
-            lines.append(f"⏳ <b>Waiting for:</b> {missing[0]}")
+    if is_early and not status.get("has_signal"):
+        sig_hint = "bullish pin bar or engulfing" if d == "LONG" else "bearish pin bar or engulfing"
+        lines.append(f"")
+        lines.append(f"⏳ <b>Waiting for:</b> 15M {sig_hint} at the zone")
+
+    # ── Bonus confluences (separated visually) ───────────────────────────────
+    bonus_items = [item for item in extra_items if "BONUS" in item]
+    other_items = [item for item in extra_items if "BONUS" not in item]
+
+    for item in other_items:
+        lines.append(f"  ↳ {item}")
+
+    if bonus_items:
+        lines.append("")
+        lines.append("⭐ <b>Bonus confluences</b>")
+        for item in bonus_items:
+            clean = item.replace("BONUS — ", "").replace("BONUS — ", "")
+            lines.append(f"  ⭐ {clean}")
 
     # ── S/R map ──────────────────────────────────────────────────────────────
     above = status.get("sr_above", [])
@@ -93,7 +156,7 @@ def _build_alert_body(status: dict, is_early: bool) -> list:
     if below:
         lines.append(f"  Support below:    {' | '.join(str(l) for l in below)}")
     if status.get("at_trendline"):
-        lines.append(f"  ⭐ Trend line at: {status['trendline_val']} ({status.get('trendline_dist_pct')}% away)")
+        lines.append(f"  ⭐ Trend line: {status['trendline_val']} ({status.get('trendline_dist_pct')}% away)")
     if status.get("is_retest"):
         lines.append(f"  ↩ Break+Retest: {status['retest_level']} — {status['retest_type']} ({status.get('bars_since_break')} bars ago)")
 
@@ -101,14 +164,15 @@ def _build_alert_body(status: dict, is_early: bool) -> list:
     sl = status.get("sl")
     tp = status.get("tp")
     if sl and tp:
-        risk = abs(price - sl)
+        risk   = abs(price - sl)
         reward = abs(tp - price)
-        rr = f"{reward/risk:.1f}" if risk > 0 else "—"
+        rr     = f"{reward/risk:.1f}" if risk > 0 else "—"
+        sl_label = "below swing low at S/R" if d == "LONG" else "above swing high at S/R"
         lines.append("")
         label = "📍 <b>Suggested Levels (1:3 R:R)</b>" if is_early else "📍 <b>Trade Levels (1:3 R:R)</b>"
         lines.append(label)
         lines.append(f"  Entry: ~{price}")
-        lines.append(f"  SL:    {sl}  ← below swing low at S/R")
+        lines.append(f"  SL:    {sl}  ← {sl_label}")
         lines.append(f"  TP:    {tp}  ← R:R {rr}:1")
 
     return lines
@@ -127,15 +191,17 @@ def send_early_warning(status: dict):
     else:
         header = f"⚠️ EARLY WARNING — {tag} <b>{pair}</b>"
 
+    narrative = _setup_narrative(status)
     lines = [
         header,
         f"Grade: <b>{grade}</b>   |   Price: <b>{price}</b>   |   Confluences: <b>{score}/4</b>",
+        f"<i>{narrative}</i>",
         "",
     ]
     lines += _build_alert_body(status, is_early=True)
     lines += [
         "",
-        "👁 Watch this pair — wait for the missing confluence, then enter.",
+        _closing_cta(status, is_early=True),
         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     ]
     _tg_post("\n".join(lines))
@@ -151,18 +217,22 @@ def send_telegram(status: dict):
 
     if grade == "A+":
         header = f"🔥 HIGH CONVICTION — {tag} <b>{pair}</b>"
+    elif status.get("is_retest"):
+        header = f"↩ BREAK+RETEST — {tag} <b>{pair}</b>"
     else:
         header = f"✅ ENTRY SIGNAL — {tag} <b>{pair}</b>"
 
+    narrative = _setup_narrative(status)
     lines = [
         header,
         f"Grade: <b>{grade}</b>   |   Price: <b>{price}</b>   |   Confluences: <b>{score}/4</b>",
+        f"<i>{narrative}</i>",
         "",
     ]
     lines += _build_alert_body(status, is_early=False)
     lines += [
         "",
-        "👉 Check fib zone on your chart — place entry, SL and TP as shown above.",
+        _closing_cta(status, is_early=False),
         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     ]
     _tg_post("\n".join(lines))

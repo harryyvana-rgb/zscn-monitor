@@ -687,9 +687,12 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
             # Only fire when price is within 1.0% of an S/R zone — otherwise
             # there is no zone to trade from and it's not an actionable setup.
             elif score == 3 and send_early_warning_fn is not None:
-                sr_dist = status.get("sr_dist_pct")
-                if sr_dist is None or sr_dist > 1.0:
-                    logger.info(f"[{name}] {direction} - 3/4 but price {sr_dist}% from S/R, skipping")
+                # Only fire when price is genuinely AT the zone (within 0.30%).
+                # The one missing confluence must be the 15M signal candle.
+                # "Approaching zone" warnings are not actionable — skip them.
+                if not status.get("at_sr"):
+                    sr_dist = status.get("sr_dist_pct")
+                    logger.info(f"[{name}] {direction} - 3/4 but not at zone yet ({sr_dist}%), skipping")
                     continue
                 last_early = early_alert_cooldown.get(early_key)
                 if last_early and (now - last_early) < timedelta(hours=ALERT_COOLDOWN_HOURS):
