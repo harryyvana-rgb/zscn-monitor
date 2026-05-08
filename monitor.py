@@ -19,7 +19,9 @@ Grade A  = 4/4 standard.
 Grade WATCH = 3/4 early warning.
 """
 
+import json
 import logging
+import os
 import threading
 from datetime import datetime, timezone, timedelta
 
@@ -27,6 +29,28 @@ import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
+
+ALERTS_LOG_PATH = os.path.join(os.path.dirname(__file__), "data", "alerts_log.json")
+_MAX_STORED_ALERTS = 500
+
+
+def _load_alerts_from_disk() -> list:
+    try:
+        if os.path.exists(ALERTS_LOG_PATH):
+            with open(ALERTS_LOG_PATH, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Could not load alerts from disk: {e}")
+    return []
+
+
+def _save_alerts_to_disk(alerts: list):
+    try:
+        os.makedirs(os.path.dirname(ALERTS_LOG_PATH), exist_ok=True)
+        with open(ALERTS_LOG_PATH, "w") as f:
+            json.dump(alerts[:_MAX_STORED_ALERTS], f, default=str, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not save alerts to disk: {e}")
 
 PAIRS = {
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "AUDUSD": "AUDUSD=X",
@@ -47,9 +71,9 @@ SR_CLUSTER_PCT        = 0.20   # merge levels within 0.20% of each other
 TRENDLINE_PROXIMITY   = 0.25   # within 0.25% of trend line = bonus confluence
 SL_BUFFER_PCT         = 0.10   # SL placed 0.10% beyond the S/R level
 
-pair_status         = {}
-recent_alerts       = []
-alert_cooldown      = {}
+pair_status          = {}
+recent_alerts        = _load_alerts_from_disk()
+alert_cooldown       = {}
 early_alert_cooldown = {}
 _lock = threading.Lock()
 
@@ -655,6 +679,7 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
                 recent_alerts.insert(0, alert)
                 if len(recent_alerts) > 100:
                     recent_alerts.pop()
+                _save_alerts_to_disk(recent_alerts)
                 send_telegram_fn(status)
                 logger.info(f"[{name}] {direction} - 4/4 - FULL ALERT sent")
 
@@ -675,6 +700,7 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
                 recent_alerts.insert(0, early)
                 if len(recent_alerts) > 100:
                     recent_alerts.pop()
+                _save_alerts_to_disk(recent_alerts)
                 send_early_warning_fn(status)
                 logger.info(f"[{name}] {direction} - 3/4 (sr_dist {sr_dist}%) - early warning sent")
 

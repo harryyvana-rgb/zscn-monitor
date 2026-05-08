@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 import threading
@@ -6,7 +7,8 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, render_template, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from monitor import run_scan, run_weekly_bias, run_friday_preview, pair_status, recent_alerts
+from monitor import (run_scan, run_weekly_bias, run_friday_preview,
+                     pair_status, recent_alerts, ALERTS_LOG_PATH)
 
 last_scan_time = None
 
@@ -438,6 +440,18 @@ def api_sr_levels(pair):
 @app.route("/api/alerts")
 def api_alerts():
     return jsonify(recent_alerts)
+
+
+@app.route("/api/alerts/history")
+def api_alerts_history():
+    """Returns all persisted alerts from disk — survives server restarts."""
+    try:
+        if os.path.exists(ALERTS_LOG_PATH):
+            with open(ALERTS_LOG_PATH, "r") as f:
+                return jsonify(json.load(f))
+    except Exception as e:
+        logger.error(f"Error reading alerts log: {e}")
+    return jsonify([])
 
 
 @app.route("/trigger-scan", methods=["POST"])
