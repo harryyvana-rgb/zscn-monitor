@@ -9,7 +9,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 from monitor import (run_scan, run_weekly_bias, run_friday_preview,
                      pair_status, recent_alerts, ALERTS_LOG_PATH,
-                     get_win_rate, get_market_update_data)
+                     get_win_rate, get_market_update_data,
+                     get_weekly_trade_report, run_backtest)
 
 last_scan_time = None
 
@@ -405,6 +406,120 @@ def send_week_opener(ready: list, watch: list, early: list):
     _tg_post("\n".join(lines))
 
 
+def send_tp_sl_alert(outcome: dict):
+    direction = outcome.get("direction", "")
+    pair      = outcome.get("pair", "?")
+    result    = outcome.get("result", "")
+    entry     = outcome.get("entry_price", "?")
+    tag       = "🟢 LONG" if direction == "LONG" else "🔴 SHORT"
+
+    if result == "WIN":
+        tp = outcome.get("tp", "?")
+        lines = [
+            f"🎯 TP HIT — {tag} <b>{pair}</b>",
+            f"Entry: <b>{entry}</b>  →  TP: <b>{tp}</b>  ✅",
+            f"Trade logged as <b>WIN</b>. Well done.",
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        ]
+    else:
+        sl = outcome.get("sl", "?")
+        lines = [
+            f"💀 SL HIT — {tag} <b>{pair}</b>",
+            f"Entry: <b>{entry}</b>  →  SL: <b>{sl}</b>  ❌",
+            f"Trade logged as <b>LOSS</b>. Cut it and move on.",
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        ]
+    _tg_post("\n".join(lines))
+
+
+def send_weekly_trade_summary():
+    report = get_weekly_trade_report()
+    now    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    lines = [f"📋 <b>Weekly Trade Log — {now}</b>", ""]
+
+    if report["total"] == 0:
+        lines.append("No closed trades this week — all setups still pending or no signals fired.")
+        lines.append("Patience is a position. 💪")
+        _tg_post("\n".join(lines))
+        return
+
+    wr_str = f"{report['win_rate']}%" if report["win_rate"] is not None else "—"
+    lines.append(f"<b>{len(report['wins'])}W / {len(report['losses'])}L</b>  |  Win rate: <b>{wr_str}</b>  |  Trades closed: {report['total']}")
+    lines.append("")
+
+    if report["wins"]:
+        lines.append("✅ <b>Winners</b>")
+        for t in report["wins"]:
+            tag   = "🟢" if t.get("direction") == "LONG" else "🔴"
+            entry = t.get("entry_price", "?")
+            tp    = t.get("tp", "?")
+            grade = t.get("grade", "A")
+            at    = t.get("result_at", "")[:10]
+            lines.append(f"  {tag} <b>{t['pair']}</b> {t.get('direction','')}  Entry {entry} → TP {tp}  [{grade}] {at}")
+        lines.append("")
+
+    if report["losses"]:
+        lines.append("❌ <b>Stopped out</b>")
+        for t in report["losses"]:
+            tag   = "🟢" if t.get("direction") == "LONG" else "🔴"
+            entry = t.get("entry_price", "?")
+            sl    = t.get("sl", "?")
+            grade = t.get("grade", "A")
+            at    = t.get("result_at", "")[:10]
+            lines.append(f"  {tag} <b>{t['pair']}</b> {t.get('direction','')}  Entry {entry} → SL {sl}  [{grade}] {at}")
+        lines.append("")
+
+    wr = get_win_rate()
+    if wr["total"] >= 3:
+        lines.append(f"📊 All-time: {wr['wins']}W/{wr['losses']}L  ({wr['win_rate']}% win rate, {wr['total']} trades tracked)")
+
+    lines.append("")
+    lines.append("Review each trade — what worked, what didn't. Only way to grow. 💪")
+    _tg_post("\n".join(lines))
+
+
+def send_backtest_report(results: dict):
+    run_at = results.get("run_at", "")
+    pairs  = results.get("pairs", [])
+    total  = results.get("total", 0)
+    wins   = results.get("wins", 0)
+    losses = results.get("losses", 0)
+    wr     = results.get("win_rate")
+
+    if total == 0:
+        _tg_post("📉 Backtest ran but found no qualifying signals in the lookback window.")
+        return
+
+    lines = [
+        f"🔬 <b>ZSCN Backtest Report — {run_at}</b>",
+        f"Overall: <b>{wins}W / {losses}L</b>  |  Win rate: <b>{wr}%</b>  |  {total} signals",
+        "",
+        "📊 <b>By pair</b>",
+    ]
+
+    for r in sorted(pairs, key=lambda x: -(x.get("win_rate") or 0)):
+        t = r["wins"] + r["losses"]
+        if t == 0:
+            lines.append(f"  {r['pair']}: no signals")
+            continue
+        bar  = "🟢" if (r["win_rate"] or 0) >= 55 else ("🟡" if (r["win_rate"] or 0) >= 40 else "🔴")
+        flag = " ⚠️ LOW CONFIDENCE" if (r["win_rate"] or 100) < 40 and t >= 5 else ""
+        lines.append(f"  {bar} {r['pair']}: {r['wins']}W/{r['losses']}L  ({r['win_rate']}%){flag}")
+
+    from monitor import LOW_CONFIDENCE_PAIRS
+    if LOW_CONFIDENCE_PAIRS:
+        lines.append("")
+        lines.append(f"⚠️ Pairs SKIPPED going forward (< 40% win rate): {', '.join(LOW_CONFIDENCE_PAIRS)}")
+    else:
+        lines.append("")
+        lines.append("✅ All pairs performing at or above threshold — no pairs skipped.")
+
+    lines.append("")
+    lines.append("Strategy calibrated. Next backtest in ~30 days.")
+    _tg_post("\n".join(lines))
+
+
 def send_invalidation_alert(trade: dict, status: dict, reason: str):
     d    = trade["direction"]
     pair = trade["pair"]
@@ -474,15 +589,34 @@ def send_market_update(update_data: dict):
 def scheduled_scan():
     global last_scan_time
     try:
-        invalidated, results = run_scan(send_telegram, send_early_warning)
+        invalidated, results, newly_resolved = run_scan(send_telegram, send_early_warning)
         last_scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-        # Send invalidation alerts
         for trade, status, reason in invalidated:
             send_invalidation_alert(trade, status, reason)
 
+        for outcome in newly_resolved:
+            send_tp_sl_alert(outcome)
+
     except Exception as e:
         logger.exception(f"Scan error: {e}")
+
+
+def scheduled_weekly_summary():
+    try:
+        send_weekly_trade_summary()
+    except Exception as e:
+        logger.exception(f"Weekly summary error: {e}")
+
+
+def scheduled_backtest():
+    def _run():
+        try:
+            results = run_backtest(lookback_days=180)
+            send_backtest_report(results)
+        except Exception as e:
+            logger.exception(f"Backtest error: {e}")
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def scheduled_market_update():
@@ -523,21 +657,22 @@ def scheduled_friday_preview():
 # Sunday 22:00 UTC (5:00 PM CDT)  — market open confirmation
 # Friday 20:00 UTC (3:00 PM CDT)  — end-of-week preview for next week
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(scheduled_scan,           "interval", minutes=30, id="continuous_scan")
-scheduler.add_job(scheduled_market_update,  "cron", hour=6,  minute=0,  id="london_update")
-scheduler.add_job(scheduled_market_update,  "cron", hour=13, minute=0,  id="ny_update")
-scheduler.add_job(scheduled_weekly_bias,    "cron", day_of_week="sun", hour=11, minute=0,  id="weekly_bias")
-scheduler.add_job(scheduled_week_opener,    "cron", day_of_week="sun", hour=22, minute=0,  id="week_opener")
-scheduler.add_job(scheduled_friday_preview, "cron", day_of_week="fri", hour=20, minute=0,  id="friday_preview")
+scheduler.add_job(scheduled_scan,            "interval", minutes=30, id="continuous_scan")
+scheduler.add_job(scheduled_market_update,   "cron", hour=6,  minute=0,  id="london_update")
+scheduler.add_job(scheduled_market_update,   "cron", hour=13, minute=0,  id="ny_update")
+scheduler.add_job(scheduled_weekly_bias,     "cron", day_of_week="sun", hour=11, minute=0,  id="weekly_bias")
+scheduler.add_job(scheduled_week_opener,     "cron", day_of_week="sun", hour=22, minute=0,  id="week_opener")
+scheduler.add_job(scheduled_friday_preview,  "cron", day_of_week="fri", hour=20, minute=0,  id="friday_preview")
+scheduler.add_job(scheduled_weekly_summary,  "cron", day_of_week="fri", hour=21, minute=0,  id="weekly_summary")
+scheduler.add_job(scheduled_backtest,        "cron", day=1,   hour=3,  minute=0,  id="monthly_backtest")
 scheduler.start()
 logger.info(
     "Scheduler started — "
     "every 30 min | "
-    "06:00 UTC (London update) | "
-    "13:00 UTC (NY update) | "
-    "Sun 11:00 UTC (bias) | "
-    "Sun 22:00 UTC (week opener) | "
-    "Fri 20:00 UTC (Friday preview)"
+    "06:00 UTC (London) | 13:00 UTC (NY) | "
+    "Fri 20:00 UTC (preview) | Fri 21:00 UTC (weekly summary) | "
+    "Sun 11:00 UTC (bias) | Sun 22:00 UTC (week opener) | "
+    "1st of month 03:00 UTC (backtest + calibration)"
 )
 
 
@@ -648,6 +783,18 @@ def trigger_friday():
 def trigger_week_opener():
     threading.Thread(target=scheduled_week_opener, daemon=True).start()
     return jsonify({"ok": True, "message": "Week opener triggered"})
+
+
+@app.route("/trigger-weekly-summary", methods=["POST"])
+def trigger_weekly_summary():
+    threading.Thread(target=scheduled_weekly_summary, daemon=True).start()
+    return jsonify({"ok": True, "message": "Weekly summary triggered"})
+
+
+@app.route("/trigger-backtest", methods=["POST"])
+def trigger_backtest():
+    threading.Thread(target=scheduled_backtest, daemon=True).start()
+    return jsonify({"ok": True, "message": "Backtest started — results sent to Telegram in ~3-5 min"})
 
 
 if __name__ == "__main__":

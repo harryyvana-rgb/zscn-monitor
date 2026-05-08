@@ -83,9 +83,13 @@ def get_win_rate() -> dict:
     return {"wins": wins, "losses": losses, "total": total,
             "win_rate": round(wins / total * 100, 1) if total > 0 else None}
 
-def update_trade_outcomes(pair_results: dict):
-    """Check all pending alerts for TP/SL hits and update records."""
+def update_trade_outcomes(pair_results: dict) -> list:
+    """
+    Check all pending alerts for TP/SL hits. Updates records and returns
+    a list of newly resolved outcomes so the caller can notify Harry.
+    """
     global trade_outcomes
+    newly_resolved = []
     updated = False
     now = datetime.now(timezone.utc)
 
@@ -107,19 +111,256 @@ def update_trade_outcomes(pair_results: dict):
         if not status or not status.get("price"):
             continue
         price = status["price"]
+        resolved = False
         if direction == "LONG":
             if price >= tp:
-                outcome["result"] = "WIN";  outcome["result_at"] = now.strftime("%Y-%m-%d %H:%M UTC"); updated = True
+                outcome["result"] = "WIN";  resolved = True
             elif price <= sl:
-                outcome["result"] = "LOSS"; outcome["result_at"] = now.strftime("%Y-%m-%d %H:%M UTC"); updated = True
+                outcome["result"] = "LOSS"; resolved = True
         elif direction == "SHORT":
             if price <= tp:
-                outcome["result"] = "WIN";  outcome["result_at"] = now.strftime("%Y-%m-%d %H:%M UTC"); updated = True
+                outcome["result"] = "WIN";  resolved = True
             elif price >= sl:
-                outcome["result"] = "LOSS"; outcome["result_at"] = now.strftime("%Y-%m-%d %H:%M UTC"); updated = True
+                outcome["result"] = "LOSS"; resolved = True
+        if resolved:
+            outcome["result_at"]   = now.strftime("%Y-%m-%d %H:%M UTC")
+            outcome["exit_price"]  = price
+            newly_resolved.append(outcome.copy())
+            updated = True
 
     if updated:
         _save_outcomes(trade_outcomes)
+    return newly_resolved
+
+
+def get_weekly_trade_report() -> dict:
+    """Returns all trades that closed in the last 7 days."""
+    now    = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=7)
+    weekly = []
+    for o in trade_outcomes:
+        if o.get("result") not in ("WIN", "LOSS"):
+            continue
+        try:
+            result_dt = datetime.strptime(
+                o.get("result_at", ""), "%Y-%m-%d %H:%M UTC"
+            ).replace(tzinfo=timezone.utc)
+            if result_dt >= cutoff:
+                weekly.append(o)
+        except Exception:
+            pass
+    wins   = [o for o in weekly if o["result"] == "WIN"]
+    losses = [o for o in weekly if o["result"] == "LOSS"]
+    total  = len(wins) + len(losses)
+    return {
+        "wins":     wins,
+        "losses":   losses,
+        "total":    total,
+        "win_rate": round(len(wins) / total * 100, 1) if total > 0 else None,
+    }
+
+
+# ── Self-calibration + backtest ──────────────────────────────────────────────
+CALIBRATION_PATH  = os.path.join(os.path.dirname(__file__), "data", "calibration.json")
+BACKTEST_LOG_PATH = os.path.join(os.path.dirname(__file__), "data", "backtest_log.json")
+BACKTEST_PAIRS    = ["GBPUSD", "EURUSD", "GBPJPY", "GBPNZD", "GBPCAD",
+                     "AUDUSD", "USDCAD", "GBPAUD", "EURGBP", "EURCAD"]
+
+LOW_CONFIDENCE_PAIRS: set = set()
+
+def _load_calibration():
+    global LOW_CONFIDENCE_PAIRS
+    try:
+        if os.path.exists(CALIBRATION_PATH):
+            with open(CALIBRATION_PATH) as f:
+                data = json.load(f)
+            LOW_CONFIDENCE_PAIRS = set(data.get("low_confidence_pairs", []))
+            logger.info(f"Calibration loaded — low-confidence pairs: {LOW_CONFIDENCE_PAIRS or 'none'}")
+    except Exception as e:
+        logger.warning(f"Could not load calibration: {e}")
+
+def _save_calibration(data: dict):
+    try:
+        os.makedirs(os.path.dirname(CALIBRATION_PATH), exist_ok=True)
+        with open(CALIBRATION_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.warning(f"Could not save calibration: {e}")
+
+_load_calibration()
+
+
+def _backtest_pair(name: str, yf_sym: str, lookback_days: int) -> dict | None:
+    """
+    Walk-forward backtest on a single pair over lookback_days.
+    Uses the same EMA + trend + ADX + S/R + 1H signal logic as the live scanner.
+    Steps every 4 4H bars (~1 day) to keep runtime reasonable.
+    """
+    try:
+        fetch  = lookback_days + 100
+        df_1h  = yf.download(yf_sym, period=f"{fetch}d",     interval="1h", progress=False, auto_adjust=True)
+        df_d   = yf.download(yf_sym, period=f"{fetch+200}d", interval="1d", progress=False, auto_adjust=True)
+        if df_1h.empty or df_d.empty or len(df_1h) < 200 or len(df_d) < 60:
+            return None
+        for df in [df_1h, df_d]:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+        ohlc  = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        df_4h = df_1h.resample("4h").agg(ohlc).dropna()
+        df_2h = df_1h.resample("2h").agg(ohlc).dropna()
+
+        # Start the walk-forward window 100 bars in (need history for indicators)
+        start = max(100, len(df_4h) - lookback_days * 6)
+        signals = []
+        last_sig = -20
+
+        for i in range(start, len(df_4h) - 40, 4):
+            if i - last_sig < 8:
+                continue
+            h4   = df_4h.iloc[:i]
+            d    = df_d[df_d.index <= df_4h.index[i - 1]]
+            h1_e = df_1h.index.searchsorted(df_4h.index[i - 1], side="right")
+            h1   = df_1h.iloc[:h1_e]
+            h2   = df_2h[df_2h.index <= df_4h.index[i - 1]]
+            if len(d) < 60 or len(h4) < 60 or len(h1) < 60 or len(h2) < 55:
+                continue
+
+            price = float(h1["Close"].iloc[-1])
+            ema_d_v  = float(_ema(d["Close"]).iloc[-1])
+            ema_4h_s = _ema(h4["Close"])
+            ema_2h_s = _ema(h2["Close"])
+            ema_1h_s = _ema(h1["Close"])
+            r4 = _is_rising(ema_4h_s)
+            r2 = _is_rising(ema_2h_s)
+
+            bull = (price > ema_d_v and price > float(ema_4h_s.iloc[-1]) and r4 and
+                    price > float(ema_2h_s.iloc[-1]) and r2 and price > float(ema_1h_s.iloc[-1]))
+            bear = (price < ema_d_v and price < float(ema_4h_s.iloc[-1]) and not r4 and
+                    price < float(ema_2h_s.iloc[-1]) and not r2 and price < float(ema_1h_s.iloc[-1]))
+            if not (bull or bear):
+                continue
+
+            direction = "LONG" if bull else "SHORT"
+            d_tr  = _trend_structure(d)
+            h4_tr = _trend_structure(h4)
+            if direction == "LONG"  and not (d_tr == "BULLISH" and h4_tr == "BULLISH"): continue
+            if direction == "SHORT" and not (d_tr == "BEARISH" and h4_tr == "BEARISH"): continue
+
+            adx = _adx(h4)
+            if adx is None or adx < 20:
+                continue
+
+            sr_levels = _find_sr_levels(d, h4)
+            nearest, sr_dist = _nearest_sr(price, sr_levels)
+            if sr_dist is None or sr_dist > SR_PROXIMITY_PCT:
+                continue
+
+            sig, sig_q = _signal_candle(h1, direction)
+            if sig == "None":
+                continue
+
+            above, below = _levels_above_below(price, sr_levels)
+            sl, tp = _calc_sl_tp(price, direction, above, below, h4)
+            if not sl or not tp:
+                continue
+
+            outcome = "EXPIRED"
+            future  = df_4h.iloc[i:i + 60]
+            for _, row in future.iterrows():
+                hi, lo = float(row["High"]), float(row["Low"])
+                if direction == "LONG":
+                    if lo <= sl: outcome = "LOSS"; break
+                    if hi >= tp: outcome = "WIN";  break
+                else:
+                    if hi >= sl: outcome = "LOSS"; break
+                    if lo <= tp: outcome = "WIN";  break
+
+            signals.append({
+                "date":       str(df_4h.index[i])[:10],
+                "direction":  direction,
+                "price":      round(price, 5),
+                "sl":         sl, "tp": tp,
+                "sig_quality": sig_q,
+                "adx":        round(adx, 1),
+                "outcome":    outcome,
+            })
+            last_sig = i
+
+        wins   = [s for s in signals if s["outcome"] == "WIN"]
+        losses = [s for s in signals if s["outcome"] == "LOSS"]
+        total  = len(wins) + len(losses)
+        return {
+            "pair":     name,
+            "signals":  len(signals),
+            "wins":     len(wins),
+            "losses":   len(losses),
+            "win_rate": round(len(wins) / total * 100, 1) if total > 0 else None,
+            "recent":   signals[-5:],
+        }
+    except Exception as e:
+        logger.warning(f"[{name}] Backtest error: {e}")
+        return None
+
+
+def _calibrate_from_backtest(results: list):
+    """Flag pairs with < 40% win rate (min 5 signals) as low-confidence."""
+    global LOW_CONFIDENCE_PAIRS
+    poor = set()
+    for r in results:
+        total = r["wins"] + r["losses"]
+        if total >= 5 and (r["win_rate"] or 100) < 40.0:
+            poor.add(r["pair"])
+            logger.info(f"[{r['pair']}] Low confidence ({r['win_rate']}%) — will skip alerts")
+    improved = LOW_CONFIDENCE_PAIRS - poor
+    new_poor  = poor - LOW_CONFIDENCE_PAIRS
+    if improved:
+        logger.info(f"Pairs RESTORED (improved): {improved}")
+    if new_poor:
+        logger.info(f"Pairs FLAGGED low-confidence: {new_poor}")
+    LOW_CONFIDENCE_PAIRS = poor
+    _save_calibration({
+        "low_confidence_pairs": list(poor),
+        "calibrated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    })
+
+
+def run_backtest(lookback_days: int = 180) -> dict:
+    """
+    Walk-forward backtest on BACKTEST_PAIRS over lookback_days.
+    Runs in a background thread — results sent to Telegram by app.py.
+    After completion runs _calibrate_from_backtest to update thresholds.
+    """
+    logger.info(f"=== Backtest started ({lookback_days}d lookback, {len(BACKTEST_PAIRS)} pairs) ===")
+    all_results = []
+    for name in BACKTEST_PAIRS:
+        yf_sym = PAIRS.get(name)
+        if not yf_sym:
+            continue
+        result = _backtest_pair(name, yf_sym, lookback_days)
+        if result:
+            all_results.append(result)
+            logger.info(f"[{name}] {result['wins']}W/{result['losses']}L win_rate={result['win_rate']}%")
+
+    total = sum(r["wins"] + r["losses"] for r in all_results)
+    wins  = sum(r["wins"] for r in all_results)
+    losses = sum(r["losses"] for r in all_results)
+    summary = {
+        "pairs":    all_results,
+        "total":    total,
+        "wins":     wins,
+        "losses":   losses,
+        "win_rate": round(wins / total * 100, 1) if total > 0 else None,
+        "run_at":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    }
+    try:
+        os.makedirs(os.path.dirname(BACKTEST_LOG_PATH), exist_ok=True)
+        with open(BACKTEST_LOG_PATH, "w") as f:
+            json.dump(summary, f, indent=2)
+    except Exception:
+        pass
+    _calibrate_from_backtest(all_results)
+    logger.info(f"=== Backtest complete. {wins}W/{losses}L overall ({summary['win_rate']}%) ===")
+    return summary
 
 
 # ── Trend quality — ADX + consolidation ──────────────────────────────────────
@@ -884,9 +1125,9 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
     now = datetime.now(timezone.utc)
 
     # Check outcomes and invalidations against latest results
-    update_trade_outcomes(results)
-    invalidated = check_invalidations(results)
-    # Caller (app.py) handles sending invalidation messages
+    newly_resolved = update_trade_outcomes(results)
+    invalidated    = check_invalidations(results)
+    # Caller (app.py) handles notifications for both
 
     with _lock:
         for name, status in results.items():
@@ -904,6 +1145,11 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
             if not status.get("is_trending", True):
                 adx = status.get("adx_4h", "?")
                 logger.info(f"[{name}] {direction} - ADX {adx} < 20 (choppy), skipping")
+                continue
+
+            # Quality gate: skip pairs with poor backtest history
+            if name in LOW_CONFIDENCE_PAIRS:
+                logger.info(f"[{name}] Low-confidence pair (backtest < 40% win rate) — skipping")
                 continue
 
             cooldown_key = f"{name}_{direction}"
@@ -963,7 +1209,7 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
                 logger.info(f"[{name}] {direction} - 3/4 at zone - early warning sent")
 
     logger.info(f"=== Scan complete. {len(results)} pairs checked ===")
-    return invalidated, results
+    return invalidated, results, newly_resolved
 
 
 # ── Weekly bias scan (Sundays) ────────────────────────────────────────────────
