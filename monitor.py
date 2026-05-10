@@ -19,6 +19,7 @@ Grade A  = 4/4 standard.
 Grade WATCH = 3/4 early warning.
 """
 
+import gc
 import json
 import logging
 import os
@@ -197,9 +198,9 @@ def _backtest_pair(name: str, yf_sym: str, lookback_days: int) -> dict | None:
     Steps every 4 4H bars (~1 day) to keep runtime reasonable.
     """
     try:
-        fetch  = lookback_days + 100
+        fetch  = lookback_days + 60
         df_1h  = yf.download(yf_sym, period=f"{fetch}d",     interval="1h", progress=False, auto_adjust=True)
-        df_d   = yf.download(yf_sym, period=f"{fetch+200}d", interval="1d", progress=False, auto_adjust=True)
+        df_d   = yf.download(yf_sym, period=f"{fetch+100}d", interval="1d", progress=False, auto_adjust=True)
         if df_1h.empty or df_d.empty or len(df_1h) < 200 or len(df_d) < 60:
             return None
         for df in [df_1h, df_d]:
@@ -300,6 +301,8 @@ def _backtest_pair(name: str, yf_sym: str, lookback_days: int) -> dict | None:
     except Exception as e:
         logger.warning(f"[{name}] Backtest error: {e}")
         return None
+    finally:
+        gc.collect()
 
 
 def _calibrate_from_backtest(results: list):
@@ -536,6 +539,7 @@ alert_cooldown       = {}
 early_alert_cooldown = {}
 bos_alert_cooldown   = {}   # separate 8h cooldown per pair/direction for BOS alerts
 _lock = threading.Lock()
+_scan_semaphore = threading.Semaphore(6)  # max 6 pairs analysed concurrently
 
 
 # ── EMA ──────────────────────────────────────────────────────────────────────
@@ -1147,9 +1151,9 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
 
     try:
         # ── Fetch data ───────────────────────────────────────────────────────
-        df_1h = yf.download(yf_symbol, period="59d",  interval="1h",
+        df_1h = yf.download(yf_symbol, period="45d",  interval="1h",
                             progress=False, auto_adjust=True)
-        df_d  = yf.download(yf_symbol, period="730d", interval="1d",
+        df_d  = yf.download(yf_symbol, period="365d", interval="1d",
                             progress=False, auto_adjust=True)
 
         if df_1h.empty or df_d.empty or len(df_1h) < 60 or len(df_d) < 60:
@@ -1400,6 +1404,9 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         logger.exception(f"[{name}] Error: {exc}")
         status["error"] = str(exc)
 
+    finally:
+        gc.collect()
+
     return status
 
 
@@ -1410,7 +1417,8 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None, send_bos_alert_fn=Non
     threads = []
 
     def worker(name, yf_sym):
-        results[name] = _check_pair(name, yf_sym)
+        with _scan_semaphore:
+            results[name] = _check_pair(name, yf_sym)
 
     for name, yf_sym in PAIRS.items():
         t = threading.Thread(target=worker, args=(name, yf_sym))
@@ -1611,7 +1619,8 @@ def run_weekly_bias(send_weekly_fn):
     threads = []
 
     def worker(name, yf_sym):
-        results[name] = _check_pair(name, yf_sym)
+        with _scan_semaphore:
+            results[name] = _check_pair(name, yf_sym)
 
     for name, yf_sym in PAIRS.items():
         t = threading.Thread(target=worker, args=(name, yf_sym))
@@ -1653,7 +1662,8 @@ def run_friday_preview(send_friday_fn):
     threads = []
 
     def worker(name, yf_sym):
-        results[name] = _check_pair(name, yf_sym)
+        with _scan_semaphore:
+            results[name] = _check_pair(name, yf_sym)
 
     for name, yf_sym in PAIRS.items():
         t = threading.Thread(target=worker, args=(name, yf_sym))
