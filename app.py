@@ -74,9 +74,12 @@ def _setup_narrative(status: dict) -> str:
     # Highlight S/R touch count if notable
     nearest = status.get("nearest_sr")
     if nearest:
-        for lvl in status.get("sr_daily", []):
-            if abs(lvl["price"] - nearest) / nearest * 100 < 0.25 and lvl.get("touches", 0) >= 3:
-                return f"Daily S/R zone with {lvl['touches']} historical touches — heavily respected level."
+        res = status.get("sr_resistance", [])
+        sup = status.get("sr_support", [])
+        for lvl in res + sup:
+            if isinstance(lvl, (int, float)) and abs(lvl - nearest) / nearest * 100 < 0.25:
+                zone_type = "Resistance" if lvl in res else "Support"
+                return f"v4 {zone_type} zone at {round(lvl, 5)} — key 4H structural level."
 
     sr_dist = status.get("sr_dist_pct")
     nr      = status.get("nearest_sr")
@@ -191,6 +194,79 @@ def _build_alert_body(status: dict, is_early: bool) -> list:
     return lines
 
 
+def send_bos_alert(status: dict, invalidated_reason: str = None):
+    """
+    Handles all BOS-related Telegram messages:
+    - invalidated_reason=None  → Stage 1: fresh BOS, draw fib and watch for pullback
+    - invalidated_reason=str   → BOS failed / pullback too deep → setup cancelled
+    """
+    d     = status["direction"]
+    pair  = status["pair"]
+    price = status["price"]
+    tag   = "🟢 LONG" if d == "LONG" else "🔴 SHORT"
+
+    if invalidated_reason:
+        # Setup failed — tell Harry to cancel the watch
+        lines = [
+            f"❌ SETUP CANCELLED — {tag} <b>{pair}</b>",
+            f"Price: <b>{price}</b>",
+            "",
+            f"<i>{invalidated_reason}</i>",
+            "",
+            "The setup no longer meets criteria. Remove from watchlist.",
+            datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        ]
+        _tg_post("\n".join(lines))
+        return
+
+    # Stage 1: fresh BOS
+    bos_level = status.get("bos_level")
+    bars_ago  = status.get("bos_bars_ago", 0)
+    broke_what     = "swing HIGH" if d == "LONG" else "swing LOW"
+    direction_word = "bullish" if d == "LONG" else "bearish"
+    hours_ago      = (bars_ago or 0) * 4
+
+    d_tr  = status.get("daily_trend", "?")
+    h4_tr = status.get("h4_trend",   "?")
+    h2_tr = status.get("h2_trend",   "?")
+    adx   = status.get("adx_4h", "?")
+
+    fib_zone = status.get("fib_zone")
+    fib_lines = []
+    if fib_zone:
+        fib_lines = [
+            "",
+            "Estimated Fib Zone (verify on chart):",
+            f"  50%  → <b>{fib_zone['fib_50']}</b>",
+            f"  61.8% → <b>{fib_zone['fib_618']}</b>",
+            f"  Impulse: {fib_zone['anchor_low']} → {fib_zone['anchor_high']}",
+        ]
+        if status.get("fib_sr_overlap"):
+            fib_lines.append(
+                f"  ⚡ v4 S/R at <b>{status['fib_sr_level']}</b> overlaps the fib zone"
+            )
+
+    lines = [
+        f"🚨 BREAK OF STRUCTURE — {tag} <b>{pair}</b>",
+        f"4H closed {'above' if d == 'LONG' else 'below'} {broke_what} "
+        f"at <b>{bos_level}</b>  (~{hours_ago}h ago)",
+        "",
+        "EMA 50 + Trend — all aligned:",
+        f"  Daily {d_tr}  ·  4H {h4_tr}  ·  2H {h2_tr}  ·  ADX {adx}",
+        f"  Current price: <b>{price}</b>",
+    ]
+    lines += fib_lines
+    lines += [
+        "",
+        f"<b>Structure broke {direction_word}.</b>",
+        "Draw your fib. Watch for pullback into 50-61.8% zone + v4 S/R.",
+        "Entry trigger: 15M pin bar or engulfing at that zone.",
+        "",
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    ]
+    _tg_post("\n".join(lines))
+
+
 def send_early_warning(status: dict):
     d     = status["direction"]
     pair  = status["pair"]
@@ -199,10 +275,20 @@ def send_early_warning(status: dict):
     grade = status.get("alert_grade", "WATCH")
     tag   = "🟢 LONG" if d == "LONG" else "🔴 SHORT"
 
-    if status.get("is_retest"):
+    # Differentiate: came from pullback tracker (post-BOS) vs standalone zone touch
+    from_pullback  = status.get("pullback_zone_reached", False)
+    pb_depth       = status.get("pullback_depth", "")
+    in_golden      = status.get("in_golden_zone", False)
+    fib_sr_overlap = status.get("fib_sr_overlap", False)
+
+    if from_pullback and in_golden and fib_sr_overlap:
+        header = f"🎯 PULLBACK AT FIB+S/R ZONE — {tag} <b>{pair}</b>"
+    elif from_pullback and in_golden:
+        header = f"📍 PULLBACK IN FIB ZONE — {tag} <b>{pair}</b>"
+    elif status.get("is_retest"):
         header = f"⚠️ BREAK+RETEST FORMING — {tag} <b>{pair}</b>"
     else:
-        header = f"⚠️ EARLY WARNING — {tag} <b>{pair}</b>"
+        header = f"⚠️ ZONE REACHED — {tag} <b>{pair}</b>"
 
     narrative = _setup_narrative(status)
     lines = [
@@ -212,9 +298,27 @@ def send_early_warning(status: dict):
         "",
     ]
     lines += _build_alert_body(status, is_early=True)
+
+    # Add fib zone detail if available
+    fib_zone = status.get("fib_zone")
+    if fib_zone:
+        depth_tag = {
+            "golden": "✅ In golden zone (50-61.8%)",
+            "deep":   "⚠️ Deep pullback (61.8-78.6%)",
+            "shallow":"⏳ Above 50% — still pulling back",
+        }.get(pb_depth, "")
+        lines += [
+            "",
+            f"Fib Zone:  50% {fib_zone['fib_50']}  ·  61.8% {fib_zone['fib_618']}",
+        ]
+        if depth_tag:
+            lines.append(f"Depth:     {depth_tag}")
+        if fib_sr_overlap:
+            lines.append(f"v4 S/R:    ⚡ {status['fib_sr_level']} inside fib zone — CONFLUENCE")
+
     lines += [
         "",
-        _closing_cta(status, is_early=True),
+        "Waiting for 15M pin bar or engulfing to confirm entry.",
         datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
     ]
     _tg_post("\n".join(lines))
@@ -243,6 +347,25 @@ def send_telegram(status: dict):
         "",
     ]
     lines += _build_alert_body(status, is_early=False)
+
+    # Show fib zone if it's part of the confluence (A+ grade)
+    fib_zone = status.get("fib_zone")
+    if fib_zone and status.get("in_golden_zone"):
+        depth_tag = {
+            "golden": "In golden zone (50-61.8%) ✅",
+            "deep":   "Deep zone (61.8-78.6%) ⚠️",
+        }.get(status.get("pullback_depth", ""), "")
+        lines += [
+            "",
+            f"Fib Zone:  50% {fib_zone['fib_50']}  ·  61.8% {fib_zone['fib_618']}",
+        ]
+        if depth_tag:
+            lines.append(f"Depth:     {depth_tag}")
+        if status.get("fib_sr_overlap"):
+            lines.append(
+                f"v4 S/R:    ⚡ {status['fib_sr_level']} — S/R inside fib zone (triple confluence)"
+            )
+
     lines += [
         "",
         _closing_cta(status, is_early=False),
@@ -589,7 +712,9 @@ def send_market_update(update_data: dict):
 def scheduled_scan():
     global last_scan_time
     try:
-        invalidated, results, newly_resolved = run_scan(send_telegram, send_early_warning)
+        invalidated, results, newly_resolved = run_scan(
+            send_telegram, send_early_warning, send_bos_alert
+        )
         last_scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
         for trade, status, reason in invalidated:
@@ -727,8 +852,8 @@ def api_sr_levels(pair):
         "direction":        status.get("direction"),
         "alert_grade":      status.get("alert_grade"),
         "confluence_score": status.get("confluence_score"),
-        "sr_daily":         status.get("sr_daily", []),
-        "sr_4h":            status.get("sr_4h", []),
+        "sr_resistance":    status.get("sr_resistance", []),
+        "sr_support":       status.get("sr_support", []),
         "sr_above":         status.get("sr_above", []),
         "sr_below":         status.get("sr_below", []),
         "pdh":              status.get("pdh"),

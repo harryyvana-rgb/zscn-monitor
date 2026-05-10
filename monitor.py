@@ -250,7 +250,7 @@ def _backtest_pair(name: str, yf_sym: str, lookback_days: int) -> dict | None:
             if adx is None or adx < 20:
                 continue
 
-            sr_levels = _find_sr_levels(d, h4)
+            sr_levels = _find_sr_levels(h4)
             nearest, sr_dist = _nearest_sr(price, sr_levels)
             if sr_dist is None or sr_dist > SR_PROXIMITY_PCT:
                 continue
@@ -534,6 +534,7 @@ pair_status          = {}
 recent_alerts        = _load_alerts_from_disk()
 alert_cooldown       = {}
 early_alert_cooldown = {}
+bos_alert_cooldown   = {}   # separate 8h cooldown per pair/direction for BOS alerts
 _lock = threading.Lock()
 
 
@@ -611,6 +612,228 @@ def _trendline_value(df: pd.DataFrame, direction: str, pivot_n: int = 10) -> flo
     return p2 + slope * (current_bar - i2)
 
 
+# ── Fib zone estimation ───────────────────────────────────────────────────────
+def _estimate_fib_zone(df_4h: pd.DataFrame, direction: str,
+                       anchor_override: float = None) -> dict | None:
+    """
+    Estimate the golden zone (50-61.8% retracement) from the most recent impulse.
+    Matches ZSCN v8 big-picture fib logic:
+      LONG:  from min(pl1, pl2) [lowest of last 2 pivot lows] → anchor_high (last HH or BOS level)
+      SHORT: from max(ph1, ph2) [highest of last 2 pivot highs] → anchor_low (last LL or BOS level)
+
+    anchor_override: use the BOS level as the impulse top/bottom when available.
+    Returns fib_50, fib_618, fib_786, anchor_low, anchor_high — all rounded to 5dp.
+    """
+    ph = _pivot_highs(df_4h, 10)
+    pl = _pivot_lows(df_4h, 10)
+
+    if direction == "LONG":
+        anchor_high = anchor_override if anchor_override else (ph[-1] if ph else None)
+        if not anchor_high:
+            return None
+        lows_below = [p for p in pl if p < anchor_high]
+        if not lows_below:
+            return None
+        anchor_low = min(lows_below[-2:]) if len(lows_below) >= 2 else lows_below[-1]
+        rng = anchor_high - anchor_low
+        if rng <= 0:
+            return None
+        return {
+            "anchor_low":  round(anchor_low, 5),
+            "anchor_high": round(anchor_high, 5),
+            "fib_50":      round(anchor_high - 0.500 * rng, 5),
+            "fib_618":     round(anchor_high - 0.618 * rng, 5),
+            "fib_786":     round(anchor_high - 0.786 * rng, 5),
+        }
+
+    elif direction == "SHORT":
+        anchor_low = anchor_override if anchor_override else (pl[-1] if pl else None)
+        if not anchor_low:
+            return None
+        highs_above = [p for p in ph if p > anchor_low]
+        if not highs_above:
+            return None
+        anchor_high = max(highs_above[-2:]) if len(highs_above) >= 2 else highs_above[-1]
+        rng = anchor_high - anchor_low
+        if rng <= 0:
+            return None
+        return {
+            "anchor_low":  round(anchor_low, 5),
+            "anchor_high": round(anchor_high, 5),
+            "fib_50":      round(anchor_low + 0.500 * rng, 5),
+            "fib_618":     round(anchor_low + 0.618 * rng, 5),
+            "fib_786":     round(anchor_low + 0.786 * rng, 5),
+        }
+
+    return None
+
+
+def _in_golden_zone(price: float, fib_zone: dict) -> bool:
+    """True if price is within the 50-61.8% retracement band (the golden zone)."""
+    if not fib_zone:
+        return False
+    lo = min(fib_zone["fib_50"], fib_zone["fib_618"])
+    hi = max(fib_zone["fib_50"], fib_zone["fib_618"])
+    return lo <= price <= hi
+
+
+def _fib_sr_overlap(fib_zone: dict, sr_levels: list) -> tuple:
+    """
+    Check if any v4 S/R level falls within the 50-78.6% fib band (the full pullback zone).
+    Returns (has_overlap, nearest_level_in_zone).
+    """
+    if not fib_zone or not sr_levels:
+        return False, None
+    lo = min(fib_zone["fib_50"], fib_zone["fib_786"])
+    hi = max(fib_zone["fib_50"], fib_zone["fib_786"])
+    inside = [l for l in sr_levels if lo <= l <= hi]
+    if not inside:
+        return False, None
+    centre = fib_zone["fib_618"]
+    best = min(inside, key=lambda l: abs(l - centre))
+    return True, round(best, 5)
+
+
+def _pullback_depth(price: float, fib_zone: dict, bos_level: float,
+                    direction: str) -> tuple:
+    """
+    Classify where price is in the pullback relative to the fib zone.
+    Returns (is_valid, depth_label).
+
+    depth_label values:
+      "bos_broken" — price crossed back through the BOS level → setup failed
+      "too_deep"   — price past 78.6% → reversal likely, setup failing
+      "deep"       — between 61.8% and 78.6% → still valid but stretched
+      "golden"     — between 50% and 61.8% → ideal entry zone
+      "shallow"    — pullback not yet at 50% → still waiting
+    """
+    if not fib_zone:
+        return True, "unknown"
+
+    f50  = fib_zone["fib_50"]
+    f618 = fib_zone["fib_618"]
+    f786 = fib_zone["fib_786"]
+
+    if direction == "LONG":
+        if price < bos_level:
+            return False, "bos_broken"
+        if price < f786:
+            return False, "too_deep"
+        if price < f618:
+            return True, "deep"
+        if price <= f50:
+            return True, "golden"
+        return True, "shallow"
+    else:
+        if price > bos_level:
+            return False, "bos_broken"
+        if price > f786:
+            return False, "too_deep"
+        if price > f618:
+            return True, "deep"
+        if price >= f50:
+            return True, "golden"
+        return True, "shallow"
+
+
+# ── Pullback state tracker (persists between scans) ───────────────────────────
+_pullback_tracker: dict = {}
+_pullback_lock = threading.Lock()
+
+
+def _register_pullback_watch(name: str, direction: str, bos_level: float,
+                              fib_zone: dict | None):
+    key = f"{name}_{direction}"
+    with _pullback_lock:
+        _pullback_tracker[key] = {
+            "pair":       name,
+            "direction":  direction,
+            "bos_level":  bos_level,
+            "fib_zone":   fib_zone,
+            "registered": datetime.now(timezone.utc).isoformat(),
+            "stage":      "waiting_pullback",
+            "zone_alerted": False,
+        }
+    logger.info(f"[{name}] Registered in pullback tracker @ BOS {bos_level}")
+
+
+def get_pullback_tracked() -> dict:
+    """Read-only snapshot of the pullback tracker for dashboard."""
+    with _pullback_lock:
+        return dict(_pullback_tracker)
+
+
+# ── Break of Structure detection ─────────────────────────────────────────────
+def _detect_bos(df_4h: pd.DataFrame, direction: str, pivot_n: int = 10) -> dict:
+    """
+    Detect if a BOS (Break of Structure) occurred recently on 4H.
+
+    Bullish BOS: a 4H bar closed above a confirmed swing high within the last 10 bars.
+    Bearish BOS: a 4H bar closed below a confirmed swing low within the last 10 bars.
+
+    The BOS level is the most recent confirmed pivot high/low from BEFORE the recent
+    window — i.e. the structural level that price just broke through.
+
+    Returns: {detected, level, bars_ago}
+    """
+    result = {"detected": False, "level": None, "bars_ago": None}
+    lookback = 10  # 10 × 4H = ~40 hours
+
+    if len(df_4h) < pivot_n * 3 + lookback:
+        return result
+
+    # History up to the start of the recent window (need pivot_n buffer)
+    history_cut = len(df_4h) - lookback - pivot_n
+    if history_cut < pivot_n * 2:
+        return result
+
+    pre_window = df_4h.iloc[:history_cut]
+    closes     = df_4h["Close"].values
+
+    if direction == "LONG":
+        ph_list = _pivot_highs_indexed(pre_window, pivot_n)
+        if not ph_list:
+            return result
+        _, bos_level = ph_list[-1]   # most recent confirmed swing high
+
+        # Price was below that level before the window; has it crossed above?
+        anchor_close = closes[-(lookback + 1)]
+        if anchor_close >= bos_level:
+            return result  # already above — not a new BOS
+
+        recent = closes[-lookback:]
+        for i, c in enumerate(recent):
+            if c > bos_level:
+                result = {
+                    "detected": True,
+                    "level":    round(bos_level, 5),
+                    "bars_ago": lookback - 1 - i,
+                }
+                return result
+
+    elif direction == "SHORT":
+        pl_list = _pivot_lows_indexed(pre_window, pivot_n)
+        if not pl_list:
+            return result
+        _, bos_level = pl_list[-1]   # most recent confirmed swing low
+
+        anchor_close = closes[-(lookback + 1)]
+        if anchor_close <= bos_level:
+            return result
+
+        recent = closes[-lookback:]
+        for i, c in enumerate(recent):
+            if c < bos_level:
+                result = {
+                    "detected": True,
+                    "level":    round(bos_level, 5),
+                    "bars_ago": lookback - 1 - i,
+                }
+                return result
+
+    return result
+
+
 # ── S/R levels ────────────────────────────────────────────────────────────────
 def _pdh_pdl(df_d: pd.DataFrame) -> list:
     """Previous Day High/Low and Previous Week High/Low."""
@@ -640,50 +863,76 @@ def _count_touches(level: float, raw_pivots: list, cluster_pct: float) -> int:
     return sum(1 for p in raw_pivots if abs(p - level) / level * 100 <= cluster_pct)
 
 
-def _find_sr_levels_detailed(df_d: pd.DataFrame, df_4h: pd.DataFrame) -> dict:
+def _find_sr_levels_v4(df_4h: pd.DataFrame) -> dict:
     """
-    Returns separate Daily and 4H S/R levels with strength (touch count).
+    Replicates ZSCN Ultimate v4 S/R zone detection exactly.
 
-    Daily:  pivot_n=15 — requires 15 bars each side (strong, significant levels).
-            Using 730 days of data catches multi-year structural levels.
-    4H:     pivot_n=12 — 2 days each side for meaningful 4H structure.
-    PDH/PDL included in 4H levels.
+    Uses ONLY 4H pivots (left=10, right=10) — no Daily, no PDH/PDL.
+
+    Resistance: pivot highs where (pivot_high - close) / pivot_high >= 0.30%
+                i.e. the high is above current price and price already moved away.
+    Support:    pivot lows where (close - pivot_low) / pivot_low >= 0.30%
+                i.e. the low is below current price and price already moved away.
+
+    Deduplication: levels within 0.20% of an existing level are skipped.
+    Max 5 levels each side (most recent first, matching v4's array.unshift logic).
 
     Returns:
-        daily: list of {price, touches} sorted by price
-        h4:    list of {price, touches} sorted by price
-        all:   flat list of all unique clustered prices (for proximity checks)
+        resistance: list of up to 5 prices (above current close)
+        support:    list of up to 5 prices (below current close)
+        all:        flat sorted list for proximity checks
     """
-    pdh_pdl_raw = _pdh_pdl(df_d)
+    if len(df_4h) < 22:
+        return {"resistance": [], "support": [], "all": []}
 
-    daily_raw = _pivot_highs(df_d, 15) + _pivot_lows(df_d, 15)
-    h4_raw    = _pivot_highs(df_4h, 12) + _pivot_lows(df_4h, 12)
+    close       = float(df_4h["Close"].iloc[-1])
+    cluster_tol = SR_CLUSTER_PCT / 100   # 0.20% as fraction
+    min_move    = SR_PROXIMITY_PCT / 100  # 0.30% as fraction
 
-    daily_clustered = _cluster_levels(daily_raw, SR_CLUSTER_PCT)
-    h4_clustered    = _cluster_levels(h4_raw + pdh_pdl_raw, SR_CLUSTER_PCT)
+    pivot_highs_list = _pivot_highs(df_4h, 10)
+    pivot_lows_list  = _pivot_lows(df_4h, 10)
 
-    all_raw       = daily_raw + h4_raw + pdh_pdl_raw
-    all_clustered = _cluster_levels(all_raw, SR_CLUSTER_PCT)
+    def _is_dup(arr: list, level: float) -> bool:
+        return any(abs(level - e) / e <= cluster_tol for e in arr)
 
-    daily_levels = [
-        {"price": round(l, 5), "touches": _count_touches(l, daily_raw, SR_CLUSTER_PCT)}
-        for l in daily_clustered
-    ]
-    h4_levels = [
-        {"price": round(l, 5), "touches": _count_touches(l, h4_raw + pdh_pdl_raw, SR_CLUSTER_PCT)}
-        for l in h4_clustered
-    ]
+    # Resistance: pivot highs above close that confirmed a genuine move down
+    res_levels: list = []
+    for ph in pivot_highs_list:
+        if ph <= close:
+            continue
+        if (ph - close) / ph < min_move:
+            continue
+        if _is_dup(res_levels, ph):
+            continue
+        res_levels.insert(0, ph)   # most recent first (array.unshift)
+        if len(res_levels) > 5:
+            res_levels.pop()
+
+    # Support: pivot lows below close that confirmed a genuine move up
+    sup_levels: list = []
+    for pl in pivot_lows_list:
+        if pl >= close:
+            continue
+        if (close - pl) / pl < min_move:
+            continue
+        if _is_dup(sup_levels, pl):
+            continue
+        sup_levels.insert(0, pl)   # most recent first
+        if len(sup_levels) > 5:
+            sup_levels.pop()
+
+    all_levels = sorted({round(l, 5) for l in res_levels + sup_levels})
 
     return {
-        "daily": daily_levels,
-        "h4":    h4_levels,
-        "all":   [round(l, 5) for l in all_clustered],
+        "resistance": [round(l, 5) for l in res_levels],
+        "support":    [round(l, 5) for l in sup_levels],
+        "all":        all_levels,
     }
 
 
-def _find_sr_levels(df_d: pd.DataFrame, df_4h: pd.DataFrame) -> list:
+def _find_sr_levels(df_4h: pd.DataFrame) -> list:
     """Flat list of all S/R levels — used for proximity/scoring checks."""
-    return _find_sr_levels_detailed(df_d, df_4h)["all"]
+    return _find_sr_levels_v4(df_4h)["all"]
 
 def _nearest_sr(price: float, levels: list) -> tuple:
     """Return (nearest_level, distance_pct) or (None, None)."""
@@ -879,10 +1128,14 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         "trends_agree": False,
         "nearest_sr": None, "sr_dist_pct": None, "at_sr": False,
         "sr_above": [], "sr_below": [],
-        "sr_daily": [], "sr_4h": [],
+        "sr_resistance": [], "sr_support": [],
         "pdh": None, "pdl": None,
         "trendline_val": None, "at_trendline": False, "trendline_dist_pct": None,
         "h2_trend": "RANGING", "all_trends_agree": False,
+        "bos_detected": False, "bos_level": None, "bos_bars_ago": None,
+        "fib_zone": None, "in_golden_zone": False,
+        "fib_sr_overlap": False, "fib_sr_level": None,
+        "pullback_valid": True, "pullback_depth": "unknown",
         "is_retest": False, "retest_level": None, "retest_type": None,
         "signal_15m": "None", "signal_quality": "None", "has_signal": False,
         "confluence_score": 0, "confluence_detail": [],
@@ -976,19 +1229,19 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         status["trends_agree"]     = trends_agree
         status["all_trends_agree"] = all_trends_agree
 
-        # ── S/R levels ───────────────────────────────────────────────────────
-        sr_detail = _find_sr_levels_detailed(df_d, df_4h)
+        # ── S/R levels (v4 logic — 4H pivots only, left=10 right=10) ────────
+        sr_detail = _find_sr_levels_v4(df_4h)
         sr_levels = sr_detail["all"]
         nearest_sr, sr_dist = _nearest_sr(price, sr_levels)
         above, below = _levels_above_below(price, sr_levels)
 
-        status["nearest_sr"]  = round(nearest_sr, 5) if nearest_sr else None
-        status["sr_dist_pct"] = sr_dist
-        status["at_sr"]       = sr_dist is not None and sr_dist <= SR_PROXIMITY_PCT
-        status["sr_above"]    = [round(l, 5) for l in above]
-        status["sr_below"]    = [round(l, 5) for l in below]
-        status["sr_daily"]    = sr_detail["daily"]   # [{price, touches}, ...]
-        status["sr_4h"]       = sr_detail["h4"]      # [{price, touches}, ...]
+        status["nearest_sr"]    = round(nearest_sr, 5) if nearest_sr else None
+        status["sr_dist_pct"]   = sr_dist
+        status["at_sr"]         = sr_dist is not None and sr_dist <= SR_PROXIMITY_PCT
+        status["sr_above"]      = [round(l, 5) for l in above]
+        status["sr_below"]      = [round(l, 5) for l in below]
+        status["sr_resistance"] = sr_detail["resistance"]  # levels above price
+        status["sr_support"]    = sr_detail["support"]     # levels below price
 
         # ── Trend line (bonus) ───────────────────────────────────────────────
         tl_val = _trendline_value(df_4h, direction, pivot_n=10)
@@ -997,6 +1250,35 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
             status["trendline_val"]      = round(tl_val, 5)
             status["trendline_dist_pct"] = round(tl_dist, 3)
             status["at_trendline"]       = tl_dist <= TRENDLINE_PROXIMITY
+
+        # ── Break of Structure ───────────────────────────────────────────────
+        bos = _detect_bos(df_4h, direction)
+        status["bos_detected"] = bos["detected"]
+        status["bos_level"]    = bos["level"]
+        status["bos_bars_ago"] = bos["bars_ago"]
+
+        # ── Fib zone (estimated from impulse, anchored to BOS level if available) ──
+        fib_anchor = bos["level"] if bos["detected"] else None
+        # Also check pullback tracker for a previously registered BOS
+        _pb_key = f"{name}_{direction}"
+        _tracked = _pullback_tracker.get(_pb_key)
+        if _tracked and not fib_anchor:
+            fib_anchor = _tracked.get("bos_level")
+        fib_zone = _estimate_fib_zone(df_4h, direction, anchor_override=fib_anchor)
+        if fib_zone:
+            in_golden    = _in_golden_zone(price, fib_zone)
+            has_overlap, overlap_level = _fib_sr_overlap(fib_zone, sr_levels)
+            pb_valid, pb_depth = _pullback_depth(
+                price, fib_zone,
+                bos_level=fib_anchor or fib_zone["anchor_high"] if direction == "LONG" else fib_anchor or fib_zone["anchor_low"],
+                direction=direction,
+            )
+            status["fib_zone"]      = fib_zone
+            status["in_golden_zone"] = in_golden
+            status["fib_sr_overlap"] = has_overlap
+            status["fib_sr_level"]   = overlap_level
+            status["pullback_valid"] = pb_valid
+            status["pullback_depth"] = pb_depth
 
         # ── Break and retest (bonus) ─────────────────────────────────────────
         br = _find_break_retest(df_4h, sr_levels, price, direction)
@@ -1078,15 +1360,31 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
                 f"{status['retest_type']} ({status['bars_since_break']} bars ago)"
             )
 
+        if status["in_golden_zone"] and status["fib_sr_overlap"]:
+            fz = status["fib_zone"]
+            detail.append(
+                f"BONUS — Fib+S/R overlap: price in golden zone "
+                f"({fz['fib_50']}–{fz['fib_618']}) + v4 S/R at {status['fib_sr_level']}"
+            )
+        elif status["in_golden_zone"]:
+            fz = status["fib_zone"]
+            detail.append(
+                f"Fib zone: price in golden zone ({fz['fib_50']}–{fz['fib_618']}) "
+                f"— no S/R overlap yet"
+            )
+
         # ── Alert grade ───────────────────────────────────────────────────────
+        fib_confluence = status["in_golden_zone"] and status["fib_sr_overlap"]
         bonus_count = sum([
             all_trends_agree,
             status.get("at_trendline", False),
             status.get("is_retest", False),
             status.get("signal_quality") == "HIGH",
+            fib_confluence,   # fib zone + S/R overlap = the gold standard
         ])
         if score >= 4:
-            status["alert_grade"] = "A+" if bonus_count >= 2 else "A"
+            # A+ requires fib+S/R overlap OR 2 other bonus conditions
+            status["alert_grade"] = "A+" if (fib_confluence or bonus_count >= 2) else "A"
         elif score == 3:
             status["alert_grade"] = "WATCH"
         else:
@@ -1106,7 +1404,7 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
 
 
 # ── Scan all 28 pairs ─────────────────────────────────────────────────────────
-def run_scan(send_telegram_fn, send_early_warning_fn=None):
+def run_scan(send_telegram_fn, send_early_warning_fn=None, send_bos_alert_fn=None):
     logger.info("=== ZSCN brain scan started ===")
     results = {}
     threads = []
@@ -1155,6 +1453,74 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
             cooldown_key = f"{name}_{direction}"
             early_key    = f"{name}_{direction}_early"
 
+            pb_key = f"{name}_{direction}"
+
+            # ── Pullback tracker: check pairs registered after a BOS ─────────
+            # This runs BEFORE the main alert logic so we can handle
+            # invalidations and zone-reached alerts for tracked pairs.
+            tracked = _pullback_tracker.get(pb_key)
+            if tracked:
+                bos_lvl = tracked.get("bos_level")
+                price    = status["price"]
+                fib_zone = tracked.get("fib_zone") or status.get("fib_zone")
+                pb_valid, pb_depth = _pullback_depth(
+                    price, fib_zone, bos_lvl, direction
+                )
+
+                if pb_depth == "bos_broken":
+                    # Setup invalidated — BOS failed, price crossed back through
+                    reason = f"Price closed back through BOS level {bos_lvl} — structure broke"
+                    if send_bos_alert_fn:
+                        send_bos_alert_fn(status, invalidated_reason=reason)
+                    with _pullback_lock:
+                        _pullback_tracker.pop(pb_key, None)
+                    logger.info(f"[{name}] Pullback INVALIDATED — {reason}")
+
+                elif pb_depth == "too_deep":
+                    # Pullback went past 78.6% — likely reversing, warn Harry
+                    if not tracked.get("deep_warned"):
+                        if send_bos_alert_fn:
+                            send_bos_alert_fn(status,
+                                invalidated_reason=(
+                                    f"Pullback went past 78.6% fib ({fib_zone['fib_786'] if fib_zone else '?'}) "
+                                    f"— setup is stretching too far"
+                                ))
+                        with _pullback_lock:
+                            if pb_key in _pullback_tracker:
+                                _pullback_tracker[pb_key]["deep_warned"] = True
+                    logger.info(f"[{name}] Pullback too deep (>{pb_depth})")
+
+                elif pb_depth in ("golden", "deep") and not tracked.get("zone_alerted"):
+                    # Price entered the fib zone — now check S/R + signal
+                    has_fib_sr = status.get("fib_sr_overlap") or status.get("at_sr")
+                    if has_fib_sr and send_early_warning_fn:
+                        # Zone reached — fire a "zone reached" alert even if
+                        # score is 3 (no 15M signal yet)
+                        with _pullback_lock:
+                            if pb_key in _pullback_tracker:
+                                _pullback_tracker[pb_key]["zone_alerted"] = True
+                        early = {**status, "received_at": now.strftime("%Y-%m-%d %H:%M UTC"),
+                                 "pullback_zone_reached": True}
+                        recent_alerts.insert(0, early)
+                        if len(recent_alerts) > 100:
+                            recent_alerts.pop()
+                        _save_alerts_to_disk(recent_alerts)
+                        send_early_warning_fn(status)
+                        logger.info(
+                            f"[{name}] {direction} — pullback in fib zone "
+                            f"({pb_depth}) + S/R — zone alert sent"
+                        )
+
+                # Auto-expire tracked pairs after 5 days
+                try:
+                    registered = datetime.fromisoformat(tracked.get("registered", ""))
+                    if (now - registered).total_seconds() > 5 * 24 * 3600:
+                        with _pullback_lock:
+                            _pullback_tracker.pop(pb_key, None)
+                        logger.info(f"[{name}] Pullback tracker expired (5d)")
+                except Exception:
+                    pass
+
             # ── Full alert (4/4) ─────────────────────────────────────────────
             if status.get("alert"):
                 last_alerted = alert_cooldown.get(cooldown_key)
@@ -1163,6 +1529,9 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
                     continue
                 alert_cooldown[cooldown_key] = now
                 early_alert_cooldown.pop(early_key, None)
+                # Full alert reached — remove from pullback tracker (setup complete)
+                with _pullback_lock:
+                    _pullback_tracker.pop(pb_key, None)
                 alert = {**status, "received_at": now.strftime("%Y-%m-%d %H:%M UTC")}
                 recent_alerts.insert(0, alert)
                 if len(recent_alerts) > 100:
@@ -1184,13 +1553,30 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None):
                 send_telegram_fn(status)
                 logger.info(f"[{name}] {direction} - 4/4 - FULL ALERT sent")
 
-            # ── Early warning (3/4) ──────────────────────────────────────────
-            # Only fire when price is within 1.0% of an S/R zone — otherwise
-            # there is no zone to trade from and it's not an actionable setup.
-            elif score == 3 and send_early_warning_fn is not None:
-                # Only fire when price is genuinely AT the zone (within 0.30%).
-                # The one missing confluence must be the 15M signal candle.
-                # "Approaching zone" warnings are not actionable — skip them.
+            # ── BOS alert ────────────────────────────────────────────────────
+            # Stage 1: BOS detected with full EMA + trend alignment.
+            # Register pair in pullback tracker + alert Harry to draw fib.
+            if (status.get("bos_detected") and send_bos_alert_fn is not None
+                    and not status.get("alert")):
+                bos_key = f"{name}_{direction}_bos"
+                last_bos = bos_alert_cooldown.get(bos_key)
+                if not last_bos or (now - last_bos) >= timedelta(hours=8):
+                    bos_alert_cooldown[bos_key] = now
+                    # Register in pullback tracker so subsequent scans watch this pair
+                    _register_pullback_watch(
+                        name, direction,
+                        bos_level=status["bos_level"],
+                        fib_zone=status.get("fib_zone"),
+                    )
+                    send_bos_alert_fn(status)
+                    logger.info(
+                        f"[{name}] {direction} - BOS at {status['bos_level']} "
+                        f"({status['bos_bars_ago']} bars ago) - BOS alert sent"
+                    )
+
+            # ── Early warning (3/4 at zone, not from a tracked BOS) ──────────
+            elif (score == 3 and send_early_warning_fn is not None
+                    and not tracked):  # tracked pairs handled above
                 if not status.get("at_sr"):
                     sr_dist = status.get("sr_dist_pct")
                     logger.info(f"[{name}] {direction} - 3/4 but not at zone yet ({sr_dist}%), skipping")
