@@ -23,7 +23,9 @@ import gc
 import json
 import logging
 import os
+import random
 import threading
+import time
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -31,6 +33,37 @@ import yfinance as yf
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _yf_download(symbol: str, period: str, interval: str,
+                 retries: int = 4) -> pd.DataFrame:
+    """
+    yfinance wrapper with exponential backoff on rate-limit errors.
+    Also adds a small random jitter before the first request so concurrent
+    threads don't all hit Yahoo Finance at the exact same millisecond.
+    """
+    time.sleep(random.uniform(0.3, 1.5))   # jitter: spread out initial requests
+    for attempt in range(retries):
+        try:
+            df = yf.download(symbol, period=period, interval=interval,
+                             progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return df
+        except Exception as e:
+            msg = str(e).lower()
+            if "rate" in msg or "too many" in msg or "429" in msg:
+                wait = (2 ** attempt) * 5 + random.uniform(0, 3)
+                logger.warning(
+                    f"[{symbol}] Rate limited (attempt {attempt+1}/{retries}) "
+                    f"— retrying in {wait:.1f}s"
+                )
+                time.sleep(wait)
+            else:
+                raise
+    logger.warning(f"[{symbol}] All {retries} download attempts failed — returning empty")
+    return pd.DataFrame()
+
 
 ALERTS_LOG_PATH = os.path.join(os.path.dirname(__file__), "data", "alerts_log.json")
 _MAX_STORED_ALERTS = 500
@@ -199,8 +232,8 @@ def _backtest_pair(name: str, yf_sym: str, lookback_days: int) -> dict | None:
     """
     try:
         fetch  = lookback_days + 60
-        df_1h  = yf.download(yf_sym, period=f"{fetch}d",     interval="1h", progress=False, auto_adjust=True)
-        df_d   = yf.download(yf_sym, period=f"{fetch+100}d", interval="1d", progress=False, auto_adjust=True)
+        df_1h  = _yf_download(yf_sym, period=f"{fetch}d",      interval="1h")
+        df_d   = _yf_download(yf_sym, period=f"{fetch+100}d", interval="1d")
         if df_1h.empty or df_d.empty or len(df_1h) < 200 or len(df_d) < 60:
             return None
         for df in [df_1h, df_d]:
@@ -539,7 +572,7 @@ alert_cooldown       = {}
 early_alert_cooldown = {}
 bos_alert_cooldown   = {}   # separate 8h cooldown per pair/direction for BOS alerts
 _lock = threading.Lock()
-_scan_semaphore = threading.Semaphore(6)  # max 6 pairs analysed concurrently
+_scan_semaphore = threading.Semaphore(4)  # max 4 pairs analysed concurrently
 
 
 # ── EMA ──────────────────────────────────────────────────────────────────────
@@ -1151,26 +1184,17 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
 
     try:
         # ── Fetch data ───────────────────────────────────────────────────────
-        df_1h = yf.download(yf_symbol, period="45d",  interval="1h",
-                            progress=False, auto_adjust=True)
-        df_d  = yf.download(yf_symbol, period="365d", interval="1d",
-                            progress=False, auto_adjust=True)
+        df_1h = _yf_download(yf_symbol, period="45d",  interval="1h")
+        df_d  = _yf_download(yf_symbol, period="365d", interval="1d")
 
         if df_1h.empty or df_d.empty or len(df_1h) < 60 or len(df_d) < 60:
             status["error"] = "Insufficient data"
             return status
 
-        for df in [df_1h, df_d]:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
         ohlc   = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
         df_4h  = df_1h.resample("4h").agg(ohlc).dropna()
         df_2h  = df_1h.resample("2h").agg(ohlc).dropna()
-        df_15m = yf.download(yf_symbol, period="5d", interval="15m",
-                             progress=False, auto_adjust=True)
-        if isinstance(df_15m.columns, pd.MultiIndex):
-            df_15m.columns = df_15m.columns.get_level_values(0)
+        df_15m = _yf_download(yf_symbol, period="5d", interval="15m")
 
         if len(df_4h) < 55 or len(df_2h) < 55:
             status["error"] = "Not enough resampled bars"
