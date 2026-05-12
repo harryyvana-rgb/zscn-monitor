@@ -1438,19 +1438,9 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
 def run_scan(send_telegram_fn, send_early_warning_fn=None, send_bos_alert_fn=None):
     logger.info("=== ZSCN brain scan started ===")
     results = {}
-    threads = []
-
-    def worker(name, yf_sym):
-        with _scan_semaphore:
-            results[name] = _check_pair(name, yf_sym)
 
     for name, yf_sym in PAIRS.items():
-        t = threading.Thread(target=worker, args=(name, yf_sym))
-        t.start()
-        threads.append(t)
-
-    for t in threads:
-        t.join(timeout=45)
+        results[name] = _check_pair(name, yf_sym)
 
     now = datetime.now(timezone.utc)
 
@@ -1640,19 +1630,9 @@ def run_weekly_bias(send_weekly_fn):
     """
     logger.info("=== Weekly bias scan started ===")
     results = {}
-    threads = []
-
-    def worker(name, yf_sym):
-        with _scan_semaphore:
-            results[name] = _check_pair(name, yf_sym)
 
     for name, yf_sym in PAIRS.items():
-        t = threading.Thread(target=worker, args=(name, yf_sym))
-        t.start()
-        threads.append(t)
-
-    for t in threads:
-        t.join(timeout=45)
+        results[name] = _check_pair(name, yf_sym)
 
     with _lock:
         for name, status in results.items():
@@ -1683,19 +1663,9 @@ def run_friday_preview(send_friday_fn):
     """
     logger.info("=== Friday preview scan started ===")
     results = {}
-    threads = []
-
-    def worker(name, yf_sym):
-        with _scan_semaphore:
-            results[name] = _check_pair(name, yf_sym)
 
     for name, yf_sym in PAIRS.items():
-        t = threading.Thread(target=worker, args=(name, yf_sym))
-        t.start()
-        threads.append(t)
-
-    for t in threads:
-        t.join(timeout=45)
+        results[name] = _check_pair(name, yf_sym)
 
     with _lock:
         for name, status in results.items():

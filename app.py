@@ -782,7 +782,7 @@ def scheduled_friday_preview():
 # Sunday 22:00 UTC (5:00 PM CDT)  — market open confirmation
 # Friday 20:00 UTC (3:00 PM CDT)  — end-of-week preview for next week
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(scheduled_scan,            "interval", minutes=15, id="continuous_scan")
+scheduler.add_job(scheduled_scan,            "interval", minutes=20, id="continuous_scan")
 scheduler.add_job(scheduled_market_update,   "cron", hour=6,  minute=0,  id="london_update")
 scheduler.add_job(scheduled_market_update,   "cron", hour=13, minute=0,  id="ny_update")
 scheduler.add_job(scheduled_weekly_bias,     "cron", day_of_week="sun", hour=11, minute=0,  id="weekly_bias")
