@@ -892,6 +892,23 @@ def trigger_scan():
     return jsonify({"ok": True, "message": "Scan triggered"})
 
 
+@app.route("/test-telegram", methods=["POST"])
+def test_telegram():
+    token = TELEGRAM_TOKEN
+    chat  = TELEGRAM_CHAT
+    if not token or not chat:
+        return jsonify({"ok": False, "error": "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set in environment variables"})
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": "✅ ZSCN Monitor — Telegram connection test successful."},
+            timeout=10,
+        )
+        return jsonify({"ok": r.ok, "status": r.status_code, "response": r.json()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 @app.route("/trigger-weekly", methods=["POST"])
 def trigger_weekly():
     threading.Thread(target=scheduled_weekly_bias, daemon=True).start()

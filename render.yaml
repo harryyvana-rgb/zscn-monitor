@@ -3,7 +3,7 @@ services:
     name: zscn-monitor
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers=1 --timeout=120
+    startCommand: gunicorn app:app --workers=1 --timeout=600 --keep-alive=5
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
