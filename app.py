@@ -1073,7 +1073,7 @@ def webhook():
                 "in_golden_zone": True,
                 "fib_zone": {"fib_50": fib_50, "fib_618": fib_618,
                              "anchor_low": None, "anchor_high": None} if fib_50 else None,
-                "fib_sr_overlap": fib_50 is not None,
+                "fib_sr_overlap": False,
             })
 
         elif stage == 6:
