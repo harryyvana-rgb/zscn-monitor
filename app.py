@@ -4,7 +4,7 @@ import logging
 import threading
 import requests
 from datetime import datetime, timezone, timedelta
-from flask import Flask, render_template, jsonify
+from flask import Flask, render_template, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from monitor import (run_scan, run_weekly_bias, run_friday_preview,
@@ -13,6 +13,10 @@ from monitor import (run_scan, run_weekly_bias, run_friday_preview,
                      get_weekly_trade_report, run_backtest)
 
 last_scan_time = None
+
+# Active setups registered via TradingView ZSCN v4 webhook (stage 5 only)
+# key = pair (e.g. "EURUSD"), value = {pair, direction, entry_price, sl, tp, grade, fired_at}
+active_webhook_setups: dict = {}
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s - %(message)s")
@@ -709,6 +713,56 @@ def send_market_update(update_data: dict):
     _tg_post("\n".join(lines))
 
 
+def check_webhook_tp_sl():
+    """Poll prices for active webhook-registered setups and fire TP/SL alerts."""
+    if not active_webhook_setups:
+        return
+    try:
+        import yfinance as yf
+    except ImportError:
+        return
+
+    pairs_to_close = []
+    for pair, setup in list(active_webhook_setups.items()):
+        sl = setup.get("sl")
+        tp = setup.get("tp")
+        if not sl or not tp:
+            continue
+        try:
+            yf_symbol = pair + "=X" if len(pair) == 6 else pair
+            info = yf.Ticker(yf_symbol).fast_info
+            price = getattr(info, "last_price", None)
+            if not price:
+                continue
+            d = setup.get("direction", "")
+            hit = None
+            if d == "LONG":
+                if price >= tp:
+                    hit = "WIN"
+                elif price <= sl:
+                    hit = "LOSS"
+            elif d == "SHORT":
+                if price <= tp:
+                    hit = "WIN"
+                elif price >= sl:
+                    hit = "LOSS"
+            if hit:
+                pairs_to_close.append((pair, hit, price))
+        except Exception as e:
+            logger.warning(f"Webhook TP/SL price check error for {pair}: {e}")
+
+    for pair, result, price in pairs_to_close:
+        setup = active_webhook_setups.pop(pair, {})
+        send_tp_sl_alert({
+            "pair": pair,
+            "direction": setup.get("direction", ""),
+            "entry_price": setup.get("entry_price"),
+            "sl": setup.get("sl"),
+            "tp": setup.get("tp"),
+            "result": result,
+        })
+
+
 def scheduled_scan():
     global last_scan_time
     try:
@@ -783,6 +837,7 @@ def scheduled_friday_preview():
 # Friday 20:00 UTC (3:00 PM CDT)  — end-of-week preview for next week
 scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(scheduled_scan,            "interval", minutes=20, id="continuous_scan")
+scheduler.add_job(check_webhook_tp_sl,       "interval", minutes=15, id="webhook_tp_sl")
 scheduler.add_job(scheduled_market_update,   "cron", hour=6,  minute=0,  id="london_update")
 scheduler.add_job(scheduled_market_update,   "cron", hour=13, minute=0,  id="ny_update")
 scheduler.add_job(scheduled_weekly_bias,     "cron", day_of_week="sun", hour=11, minute=0,  id="weekly_bias")
@@ -937,6 +992,113 @@ def trigger_weekly_summary():
 def trigger_backtest():
     threading.Thread(target=scheduled_backtest, daemon=True).start()
     return jsonify({"ok": True, "message": "Backtest started — results sent to Telegram in ~3-5 min"})
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """
+    Receives JSON alerts from ZSCN Ultimate v4 via TradingView webhook.
+    Pine alert() fires on stage transitions (2=BOS, 4=Confluence, 5=TradeReady, 6=Invalidated).
+    Harry creates ONE alert per pair in TradingView: condition = 'Any alert() call'.
+    """
+    try:
+        data = request.get_json(force=True)
+        if not data:
+            return jsonify({"ok": False, "error": "No JSON body"}), 400
+
+        raw_pair  = str(data.get("pair", "UNKNOWN"))
+        pair      = raw_pair.upper().replace("OANDA:", "").replace("FX:", "").replace("FOREXCOM:", "")
+        direction = str(data.get("direction", ""))
+        stage     = int(data.get("stage", 0))
+        price     = float(data.get("price", 0) or 0)
+
+        logger.info(f"Webhook: {pair} stage={stage} {direction} @ {price}")
+
+        if stage == 2:
+            fib_50  = float(data.get("fib_50",  0) or 0) or None
+            fib_618 = float(data.get("fib_618", 0) or 0) or None
+            send_bos_alert({
+                "pair": pair, "direction": direction, "price": price,
+                "bos_level": price,
+                "daily_trend": direction, "h4_trend": direction, "h2_trend": direction,
+                "adx_4h": "—",
+                "fib_zone": {"fib_50": fib_50, "fib_618": fib_618,
+                             "anchor_low": None, "anchor_high": None} if fib_50 else None,
+                "fib_sr_overlap": False,
+            })
+
+        elif stage == 4:
+            fib_50  = float(data.get("fib_50",  0) or 0) or None
+            fib_618 = float(data.get("fib_618", 0) or 0) or None
+            in_fib  = bool(data.get("in_fib", False))
+            send_early_warning({
+                "pair": pair, "direction": direction, "price": price,
+                "confluence_score": 3, "alert_grade": "B",
+                "confluence_detail": [
+                    "4-TF EMA aligned (D + 4H + 2H + 1H)",
+                    "4H BOS confirmed in trend direction",
+                    "Price at confluence zone — waiting 15M signal",
+                ],
+                "pullback_zone_reached": True,
+                "in_golden_zone": in_fib,
+                "fib_zone": {"fib_50": fib_50, "fib_618": fib_618,
+                             "anchor_low": None, "anchor_high": None} if fib_50 else None,
+                "fib_sr_overlap": False,
+            })
+
+        elif stage == 5:
+            sl      = float(data.get("sl",      0) or 0) or None
+            tp      = float(data.get("tp",      0) or 0) or None
+            fib_50  = float(data.get("fib_50",  0) or 0) or None
+            fib_618 = float(data.get("fib_618", 0) or 0) or None
+
+            active_webhook_setups[pair] = {
+                "pair": pair, "direction": direction, "entry_price": price,
+                "sl": sl, "tp": tp, "grade": "A+",
+                "fired_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+            send_telegram({
+                "pair": pair, "direction": direction, "price": price,
+                "confluence_score": 5, "alert_grade": "A+",
+                "sl": sl, "tp": tp,
+                "signal_quality": "HIGH" if sl and tp else "MEDIUM",
+                "confluence_detail": [
+                    "4-TF EMA fully aligned (D + 4H + 2H + 1H)",
+                    "4H BOS confirmed in trend direction",
+                    "Slow retest to EMA 50 zone confirmed",
+                    "Price in fib 50–61.8% + S/R confluence zone",
+                    "15M confirmation candle closed",
+                ],
+                "in_golden_zone": True,
+                "fib_zone": {"fib_50": fib_50, "fib_618": fib_618,
+                             "anchor_low": None, "anchor_high": None} if fib_50 else None,
+                "fib_sr_overlap": fib_50 is not None,
+            })
+
+        elif stage == 6:
+            trade = active_webhook_setups.pop(pair, None)
+            status = {"pair": pair, "direction": direction, "price": price}
+            if trade:
+                send_invalidation_alert(trade, status,
+                    "ZSCN v4 stage 6 — trend flipped or BOS reversed. Do not enter.")
+            else:
+                _tg_post(
+                    f"⚠️ <b>{pair}</b> — Setup invalidated (Stage 6).\n"
+                    f"Was not in active tracking (may have been cleared already)."
+                )
+
+        return jsonify({"ok": True, "pair": pair, "stage": stage})
+
+    except Exception as e:
+        logger.exception(f"Webhook error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/setups")
+def api_setups():
+    """Active Stage-5 setups registered via ZSCN v4 webhook."""
+    return jsonify(list(active_webhook_setups.values()))
 
 
 if __name__ == "__main__":
