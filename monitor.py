@@ -649,8 +649,7 @@ def _market_state(now: datetime | None = None, market_kind: str = "FOREX") -> st
         return "OPEN" if weekday < 5 and 13 <= now.hour < 21 else "CLOSED"
     if weekday == 5:
         return "CLOSED"
-    # Allow one hour for Sunday feeds to publish their first bar.
-    if weekday == 6 and now.hour < 22:
+    if weekday == 6 and now.hour < 21:
         return "CLOSED"
     if weekday == 4 and now.hour >= 21:
         return "CLOSED"

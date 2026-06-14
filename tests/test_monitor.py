@@ -36,7 +36,7 @@ class LiveStatusTests(unittest.TestCase):
 
     def test_forex_weekend_is_reported_closed(self):
         sunday_before_open = datetime(2026, 6, 14, 20, 0, tzinfo=timezone.utc)
-        sunday_after_open = datetime(2026, 6, 14, 22, 0, tzinfo=timezone.utc)
+        sunday_after_open = datetime(2026, 6, 14, 21, 30, tzinfo=timezone.utc)
 
         self.assertEqual(monitor._market_state(sunday_before_open), "CLOSED")
         self.assertEqual(monitor._market_state(sunday_after_open), "OPEN")
