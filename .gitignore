@@ -6,5 +6,7 @@ __pycache__/
 venv/
 .venv/
 alerts.json
+data/pair_status.json
+data/pair_status.json.tmp
 *.log
 .DS_Store

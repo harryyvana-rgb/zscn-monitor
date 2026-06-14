@@ -30,7 +30,8 @@ class WebhookTests(unittest.TestCase):
         self.assertEqual(response.status_code, 401)
 
     @patch.object(app, "send_telegram")
-    def test_stage_6_registers_trade_ready_setup(self, send_telegram):
+    @patch.object(app, "record_live_event")
+    def test_stage_6_registers_trade_ready_setup(self, record_live_event, send_telegram):
         response = self.client.post(
             "/webhook",
             json={
@@ -47,10 +48,12 @@ class WebhookTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn("EURUSD", app.active_webhook_setups)
+        record_live_event.assert_called_once()
         send_telegram.assert_called_once()
 
     @patch.object(app, "send_invalidation_alert")
-    def test_stage_7_invalidates_active_setup(self, send_invalidation_alert):
+    @patch.object(app, "record_live_event")
+    def test_stage_7_invalidates_active_setup(self, record_live_event, send_invalidation_alert):
         app.active_webhook_setups["EURUSD"] = {
             "pair": "EURUSD",
             "direction": "LONG",
@@ -66,6 +69,7 @@ class WebhookTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("EURUSD", app.active_webhook_setups)
+        record_live_event.assert_called_once()
         send_invalidation_alert.assert_called_once()
 
 

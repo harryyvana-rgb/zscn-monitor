@@ -10,7 +10,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from monitor import (run_scan, run_weekly_bias, run_friday_preview,
                      pair_status, recent_alerts, ALERTS_LOG_PATH,
                      get_win_rate, get_market_update_data,
-                     get_weekly_trade_report, run_backtest)
+                     get_weekly_trade_report, run_backtest,
+                     PAIRS, SCAN_INTERVAL_MINUTES, record_live_event)
 
 last_scan_time = None
 scan_state = {
@@ -789,6 +790,8 @@ def scheduled_scan():
         scan_state.update({
             "status": "completed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
+            "pairs_fresh": sum(1 for status in results.values() if not status.get("stale")),
+            "pairs_stale": sum(1 for status in results.values() if status.get("stale")),
         })
 
         for trade, status, reason in invalidated:
@@ -858,7 +861,7 @@ def scheduled_friday_preview():
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
-# Continuous scan every 30 min (no session restriction)
+# Continuous scan on a five-minute cadence (no session restriction)
 # Sunday 11:00 UTC (6:00 AM CDT)  — morning preparation bias
 # Sunday 22:00 UTC (5:00 PM CDT)  — market open confirmation
 # Friday 20:00 UTC (3:00 PM CDT)  — end-of-week preview for next week
@@ -866,7 +869,7 @@ scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(
     scheduled_scan,
     "interval",
-    minutes=20,
+    minutes=SCAN_INTERVAL_MINUTES,
     id="continuous_scan",
     next_run_time=datetime.now(timezone.utc) + timedelta(seconds=10),
     max_instances=1,
@@ -884,7 +887,7 @@ if os.environ.get("ZSCN_DISABLE_SCHEDULER") != "1":
     scheduler.start()
     logger.info(
         "Scheduler started — "
-        "every 20 min | "
+        f"every {SCAN_INTERVAL_MINUTES} min | "
         "06:00 UTC (London) | 13:00 UTC (NY) | "
         "Fri 20:00 UTC (preview) | Fri 21:00 UTC (weekly summary) | "
         "Sun 11:00 UTC (bias) | Sun 22:00 UTC (week opener) | "
@@ -899,13 +902,17 @@ def index():
 
 @app.route("/health")
 def health():
+    statuses = list(pair_status.values())
     return jsonify({
         "ok": True,
         "status": "running",
         "pairs_tracked": len(pair_status),
-        "pairs_expected": 28,
+        "pairs_expected": len(PAIRS),
+        "pairs_fresh": sum(1 for status in statuses if not status.get("stale")),
+        "pairs_stale": sum(1 for status in statuses if status.get("stale")),
         "alerts_fired": len(recent_alerts),
         "last_scan": last_scan_time,
+        "scan_interval_minutes": SCAN_INTERVAL_MINUTES,
         "scan": dict(scan_state),
     })
 
@@ -920,7 +927,9 @@ def dashboard():
         "dashboard.html",
         pairs=sorted_pairs,
         alerts=recent_alerts,
-        last_scan=last_scan_time or "Waiting for first scan…"
+        last_scan=last_scan_time or "Waiting for first scan…",
+        expected_pairs=len(PAIRS),
+        scan_interval=SCAN_INTERVAL_MINUTES,
     )
 
 
@@ -1065,6 +1074,7 @@ def webhook():
         price     = float(data.get("price", 0) or 0)
 
         logger.info(f"Webhook: {pair} stage={stage} {direction} @ {price}")
+        record_live_event(pair, data)
 
         event = str(data.get("event", "")).lower()
 

@@ -74,6 +74,7 @@ def _yf_download(symbol: str, period: str, interval: str,
 
 
 ALERTS_LOG_PATH = os.path.join(os.path.dirname(__file__), "data", "alerts_log.json")
+PAIR_STATUS_PATH = os.path.join(os.path.dirname(__file__), "data", "pair_status.json")
 _MAX_STORED_ALERTS = 500
 
 
@@ -94,6 +95,29 @@ def _save_alerts_to_disk(alerts: list):
             json.dump(alerts[:_MAX_STORED_ALERTS], f, default=str, indent=2)
     except Exception as e:
         logger.warning(f"Could not save alerts to disk: {e}")
+
+
+def _load_pair_status_from_disk() -> dict:
+    try:
+        if os.path.exists(PAIR_STATUS_PATH):
+            with open(PAIR_STATUS_PATH, "r") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                return saved
+    except Exception as e:
+        logger.warning(f"Could not load pair status from disk: {e}")
+    return {}
+
+
+def _save_pair_status_to_disk(statuses: dict):
+    try:
+        os.makedirs(os.path.dirname(PAIR_STATUS_PATH), exist_ok=True)
+        temp_path = f"{PAIR_STATUS_PATH}.tmp"
+        with open(temp_path, "w") as f:
+            json.dump(statuses, f, default=str, indent=2)
+        os.replace(temp_path, PAIR_STATUS_PATH)
+    except Exception as e:
+        logger.warning(f"Could not save pair status to disk: {e}")
 
 
 # ── Outcome tracking (self-learning foundation) ───────────────────────────────
@@ -565,16 +589,32 @@ PAIRS = {
     "AUDCAD": "AUDCAD=X", "AUDNZD": "AUDNZD=X", "AUDJPY": "AUDJPY=X",
     "AUDCHF": "AUDCHF=X", "NZDJPY": "NZDJPY=X", "NZDCHF": "NZDCHF=X",
     "CADJPY": "CADJPY=X", "CADCHF": "CADCHF=X", "CHFJPY": "CHFJPY=X",
-    "XAUUSD": "GC=F",
+    "XAUUSD": "GC=F", "NZDCAD": "NZDCAD=X",
+    "BTCUSD": "BTC-USD", "LTCUSDT": "LTC-USD",
+    "US30USD": "^DJI", "VIX": "^VIX", "TSLA": "TSLA",
 }
 
+RED_PAIRS = {"EURAUD", "EURNZD", "NZDCHF"}
+WATCHLIST_BY_PAIR = {
+    pair: ("Red" if pair in RED_PAIRS else "Cyan")
+    for pair in PAIRS
+}
+MARKET_KIND_BY_PAIR = {
+    **{pair: "FOREX" for pair in PAIRS},
+    "BTCUSD": "CRYPTO",
+    "LTCUSDT": "CRYPTO",
+    "US30USD": "INDEX",
+    "VIX": "US_MARKET",
+    "TSLA": "US_MARKET",
+}
+SCAN_INTERVAL_MINUTES = 5
 ALERT_COOLDOWN_HOURS  = 4
 SR_PROXIMITY_PCT      = 0.30   # within 0.30% = "at the zone"
 SR_CLUSTER_PCT        = 0.20   # merge levels within 0.20% of each other
 TRENDLINE_PROXIMITY   = 0.25   # within 0.25% of trend line = bonus confluence
 SL_BUFFER_PCT         = 0.10   # SL placed 0.10% beyond the S/R level
 
-pair_status          = {}
+pair_status          = _load_pair_status_from_disk()
 recent_alerts        = _load_alerts_from_disk()
 alert_cooldown       = {}
 early_alert_cooldown = {}
@@ -590,6 +630,46 @@ def _ema(series: pd.Series, period: int = 50) -> pd.Series:
 def _is_rising(s: pd.Series) -> bool:
     # Compare 3 bars back — single-bar comparison is too noisy on resampled data
     return float(s.iloc[-1]) > float(s.iloc[-4])
+
+
+def _ema_side(price: float, ema_value: float) -> str:
+    if price > ema_value:
+        return "BULLISH"
+    if price < ema_value:
+        return "BEARISH"
+    return "FLAT"
+
+
+def _market_state(now: datetime | None = None, market_kind: str = "FOREX") -> str:
+    now = now or datetime.now(timezone.utc)
+    if market_kind == "CRYPTO":
+        return "OPEN"
+    weekday = now.weekday()
+    if market_kind == "US_MARKET":
+        return "OPEN" if weekday < 5 and 13 <= now.hour < 21 else "CLOSED"
+    if weekday == 5:
+        return "CLOSED"
+    if weekday == 6 and now.hour < 21:
+        return "CLOSED"
+    if weekday == 4 and now.hour >= 21:
+        return "CLOSED"
+    return "OPEN"
+
+
+def _data_timestamp(index_value) -> tuple[str | None, int | None]:
+    try:
+        timestamp = pd.Timestamp(index_value)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        age_minutes = max(
+            0,
+            int((datetime.now(timezone.utc) - timestamp.to_pydatetime()).total_seconds() / 60),
+        )
+        return timestamp.isoformat(), age_minutes
+    except Exception:
+        return None, None
 
 
 # ── Trend structure ───────────────────────────────────────────────────────────
@@ -1166,9 +1246,15 @@ def _find_break_retest(df_4h: pd.DataFrame, sr_levels: list,
 
 # ── Main pair analysis ────────────────────────────────────────────────────────
 def _check_pair(name: str, yf_symbol: str) -> dict:
+    checked_at = datetime.now(timezone.utc)
     status = {
         "pair": name, "price": None,
+        "watchlist": WATCHLIST_BY_PAIR.get(name, "Cyan"),
         "direction": "NONE", "ema_aligned": False,
+        "tf_d": "UNKNOWN", "tf_4h": "UNKNOWN",
+        "tf_2h": "UNKNOWN", "tf_1h": "UNKNOWN",
+        "ema_d": None, "ema_4h": None, "ema_2h": None, "ema_1h": None,
+        "ema_4h_slope": "UNKNOWN", "ema_2h_slope": "UNKNOWN",
         "daily_trend": "RANGING", "h4_trend": "RANGING",
         "trends_agree": False,
         "nearest_sr": None, "sr_dist_pct": None, "at_sr": False,
@@ -1186,7 +1272,12 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         "confluence_score": 0, "confluence_detail": [],
         "sl": None, "tp": None, "alert_grade": "—",
         "alert": False, "early_warning": False,
-        "last_checked": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+        "last_checked": checked_at.strftime("%H:%M UTC"),
+        "last_checked_at": checked_at.isoformat(),
+        "data_as_of": None, "data_age_minutes": None,
+        "market_state": _market_state(checked_at, MARKET_KIND_BY_PAIR.get(name, "FOREX")),
+        "stale": False, "failure_count": 0,
+        "source": "Yahoo Finance",
         "error": None,
     }
 
@@ -1239,6 +1330,22 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
                     price < ema_1h_val)
 
         status["price"]       = round(price, 5)
+        status["ema_d"]       = round(ema_d_val, 5)
+        status["ema_4h"]      = round(ema_4h_val, 5)
+        status["ema_2h"]      = round(ema_2h_val, 5)
+        status["ema_1h"]      = round(ema_1h_val, 5)
+        status["tf_d"]        = _ema_side(price, ema_d_val)
+        status["tf_4h"]       = _ema_side(price, ema_4h_val)
+        status["tf_2h"]       = _ema_side(price, ema_2h_val)
+        status["tf_1h"]       = _ema_side(price, ema_1h_val)
+        status["ema_4h_slope"] = "UP" if ema_4h_rising else "DOWN"
+        status["ema_2h_slope"] = "UP" if ema_2h_rising else "DOWN"
+        status["data_as_of"], status["data_age_minutes"] = _data_timestamp(df_1h.index[-1])
+        status["stale"] = (
+            status["market_state"] == "OPEN"
+            and status["data_age_minutes"] is not None
+            and status["data_age_minutes"] > 90
+        )
         status["ema_aligned"] = bull_ema or bear_ema
         status["direction"]   = "LONG" if bull_ema else ("SHORT" if bear_ema else "NONE")
 
@@ -1446,9 +1553,33 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
 def run_scan(send_telegram_fn, send_early_warning_fn=None, send_bos_alert_fn=None):
     logger.info("=== ZSCN brain scan started ===")
     results = {}
+    fresh_results = {}
 
     for name, yf_sym in PAIRS.items():
-        results[name] = _check_pair(name, yf_sym)
+        candidate = _check_pair(name, yf_sym)
+        if candidate.get("error"):
+            with _lock:
+                previous = dict(pair_status.get(name, {}))
+            if previous.get("price") is not None:
+                previous.update({
+                    "watchlist": WATCHLIST_BY_PAIR.get(name, "Cyan"),
+                    "last_attempt_at": candidate.get("last_checked_at"),
+                    "last_attempt": candidate.get("last_checked"),
+                    "error": candidate["error"],
+                    "stale": True,
+                    "failure_count": int(previous.get("failure_count", 0)) + 1,
+                    "source_status": "Last good reading",
+                })
+                results[name] = previous
+            else:
+                candidate["stale"] = True
+                candidate["failure_count"] = 1
+                results[name] = candidate
+        else:
+            candidate["source_status"] = "Live scan"
+            results[name] = candidate
+            fresh_results[name] = candidate
+
         # Publish progress pair-by-pair during the several-minute scan.
         with _lock:
             pair_status[name] = results[name]
@@ -1456,13 +1587,15 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None, send_bos_alert_fn=Non
     now = datetime.now(timezone.utc)
 
     # Check outcomes and invalidations against latest results
-    newly_resolved = update_trade_outcomes(results)
-    invalidated    = check_invalidations(results)
+    newly_resolved = update_trade_outcomes(fresh_results)
+    invalidated    = check_invalidations(fresh_results)
     # Caller (app.py) handles notifications for both
 
     with _lock:
         for name, status in results.items():
             pair_status[name] = status
+            if status.get("stale"):
+                continue
             direction    = status.get("direction", "NONE")
             score        = status.get("confluence_score", 0)
 
@@ -1627,8 +1760,47 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None, send_bos_alert_fn=Non
                 send_early_warning_fn(status)
                 logger.info(f"[{name}] {direction} - 3/4 at zone - early warning sent")
 
-    logger.info(f"=== Scan complete. {len(results)} pairs checked ===")
+        _save_pair_status_to_disk(pair_status)
+
+    logger.info(
+        f"=== Scan complete. {len(results)} pairs checked, "
+        f"{len(fresh_results)} fresh ==="
+    )
     return invalidated, results, newly_resolved
+
+
+def record_live_event(pair: str, data: dict) -> dict:
+    """Merge a TradingView webhook event into the latest dashboard status."""
+    normalized = pair.upper()
+    now = datetime.now(timezone.utc)
+    with _lock:
+        status = dict(pair_status.get(normalized, {
+            "pair": normalized,
+            "watchlist": WATCHLIST_BY_PAIR.get(normalized, "Cyan"),
+            "direction": "NONE",
+            "ema_aligned": False,
+        }))
+        status.update({
+            "pair": normalized,
+            "watchlist": WATCHLIST_BY_PAIR.get(normalized, status.get("watchlist", "Cyan")),
+            "price": float(data.get("price", 0) or 0) or status.get("price"),
+            "direction": str(data.get("direction", status.get("direction", "NONE"))).upper(),
+            "webhook_stage": int(data.get("stage", 0) or 0),
+            "webhook_event": str(data.get("event", "") or ""),
+            "last_activity_at": now.isoformat(),
+            "last_checked": now.strftime("%H:%M UTC"),
+            "last_checked_at": now.isoformat(),
+            "source": "TradingView webhook",
+            "source_status": "Live event",
+            "stale": False,
+            "error": None,
+        })
+        for key in ("tf_d", "tf_4h", "tf_2h", "tf_1h"):
+            if data.get(key):
+                status[key] = str(data[key]).upper()
+        pair_status[normalized] = status
+        _save_pair_status_to_disk(pair_status)
+        return dict(status)
 
 
 # ── Weekly bias scan (Sundays) ────────────────────────────────────────────────
