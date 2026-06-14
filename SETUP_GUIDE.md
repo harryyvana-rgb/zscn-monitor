@@ -31,8 +31,9 @@ git push -u origin main
    - **Build command**: `pip install -r requirements.txt`
    - **Start command**: `gunicorn app:app`
 4. Add environment variables (click "Environment"):
-   - `TELEGRAM_BOT_TOKEN` = `8678814045:AAHoR2pI1QWnCb4yOdf-FhYB3oIU-qtLqmo`
-   - `TELEGRAM_CHAT_ID` = `5817967688`
+   - `TELEGRAM_BOT_TOKEN` = your Telegram bot token
+   - `TELEGRAM_CHAT_ID` = your Telegram chat ID
+   - `TRADINGVIEW_WEBHOOK_SECRET` = a long random value
 5. Click **Deploy**
 6. Wait ~2 minutes. Your URL will be: `https://zscn-monitor.onrender.com`
 
@@ -60,7 +61,7 @@ For each of your 28 pairs:
 4. **Message**: leave as is (the JSON is auto-filled from the Pine Script)
 5. **Notifications**: check "Webhook URL" → paste:
    ```
-   https://zscn-monitor.onrender.com/webhook
+   https://zscn-monitor.onrender.com/webhook?secret=YOUR_TRADINGVIEW_WEBHOOK_SECRET
    ```
 6. **Expiration**: set to max (1 month, then renew)
 7. Repeat for "ZSCN SHORT Setup" on the same pair

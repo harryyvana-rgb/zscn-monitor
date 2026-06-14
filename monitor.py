@@ -1441,6 +1441,9 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None, send_bos_alert_fn=Non
 
     for name, yf_sym in PAIRS.items():
         results[name] = _check_pair(name, yf_sym)
+        # Publish progress pair-by-pair during the several-minute scan.
+        with _lock:
+            pair_status[name] = results[name]
 
     now = datetime.now(timezone.utc)
 

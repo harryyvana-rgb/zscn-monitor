@@ -13,8 +13,15 @@ from monitor import (run_scan, run_weekly_bias, run_friday_preview,
                      get_weekly_trade_report, run_backtest)
 
 last_scan_time = None
+scan_state = {
+    "status": "idle",
+    "started_at": None,
+    "completed_at": None,
+    "error": None,
+}
+scan_lock = threading.Lock()
 
-# Active setups registered via TradingView ZSCN v4 webhook (stage 5 only)
+# Active trade-ready setups registered by TradingView stage 6 alerts.
 # key = pair (e.g. "EURUSD"), value = {pair, direction, entry_price, sl, tp, grade, fired_at}
 active_webhook_setups: dict = {}
 
@@ -765,11 +772,24 @@ def check_webhook_tp_sl():
 
 def scheduled_scan():
     global last_scan_time
+    if not scan_lock.acquire(blocking=False):
+        logger.info("Scan already running; skipping duplicate request")
+        return
+    scan_state.update({
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "error": None,
+    })
     try:
         invalidated, results, newly_resolved = run_scan(
             send_telegram, send_early_warning, send_bos_alert
         )
         last_scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        scan_state.update({
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        })
 
         for trade, status, reason in invalidated:
             send_invalidation_alert(trade, status, reason)
@@ -778,7 +798,14 @@ def scheduled_scan():
             send_tp_sl_alert(outcome)
 
     except Exception as e:
+        scan_state.update({
+            "status": "failed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "error": str(e),
+        })
         logger.exception(f"Scan error: {e}")
+    finally:
+        scan_lock.release()
 
 
 def scheduled_weekly_summary():
@@ -836,7 +863,15 @@ def scheduled_friday_preview():
 # Sunday 22:00 UTC (5:00 PM CDT)  — market open confirmation
 # Friday 20:00 UTC (3:00 PM CDT)  — end-of-week preview for next week
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(scheduled_scan,            "interval", minutes=20, id="continuous_scan")
+scheduler.add_job(
+    scheduled_scan,
+    "interval",
+    minutes=20,
+    id="continuous_scan",
+    next_run_time=datetime.now(timezone.utc) + timedelta(seconds=10),
+    max_instances=1,
+    coalesce=True,
+)
 scheduler.add_job(check_webhook_tp_sl,       "interval", minutes=15, id="webhook_tp_sl")
 scheduler.add_job(scheduled_market_update,   "cron", hour=6,  minute=0,  id="london_update")
 scheduler.add_job(scheduled_market_update,   "cron", hour=13, minute=0,  id="ny_update")
@@ -845,15 +880,16 @@ scheduler.add_job(scheduled_week_opener,     "cron", day_of_week="sun", hour=22,
 scheduler.add_job(scheduled_friday_preview,  "cron", day_of_week="fri", hour=20, minute=0,  id="friday_preview")
 scheduler.add_job(scheduled_weekly_summary,  "cron", day_of_week="fri", hour=21, minute=0,  id="weekly_summary")
 scheduler.add_job(scheduled_backtest,        "cron", day=1,   hour=3,  minute=0,  id="monthly_backtest")
-scheduler.start()
-logger.info(
-    "Scheduler started — "
-    "every 30 min | "
-    "06:00 UTC (London) | 13:00 UTC (NY) | "
-    "Fri 20:00 UTC (preview) | Fri 21:00 UTC (weekly summary) | "
-    "Sun 11:00 UTC (bias) | Sun 22:00 UTC (week opener) | "
-    "1st of month 03:00 UTC (backtest + calibration)"
-)
+if os.environ.get("ZSCN_DISABLE_SCHEDULER") != "1":
+    scheduler.start()
+    logger.info(
+        "Scheduler started — "
+        "every 20 min | "
+        "06:00 UTC (London) | 13:00 UTC (NY) | "
+        "Fri 20:00 UTC (preview) | Fri 21:00 UTC (weekly summary) | "
+        "Sun 11:00 UTC (bias) | Sun 22:00 UTC (week opener) | "
+        "1st of month 03:00 UTC (backtest + calibration)"
+    )
 
 
 @app.route("/")
@@ -867,8 +903,10 @@ def health():
         "ok": True,
         "status": "running",
         "pairs_tracked": len(pair_status),
+        "pairs_expected": 28,
         "alerts_fired": len(recent_alerts),
         "last_scan": last_scan_time,
+        "scan": dict(scan_state),
     })
 
 
@@ -943,8 +981,14 @@ def api_alerts_history():
 
 @app.route("/trigger-scan", methods=["POST"])
 def trigger_scan():
+    if scan_lock.locked():
+        return jsonify({
+            "ok": False,
+            "message": "Scan already running",
+            "scan": dict(scan_state),
+        }), 409
     threading.Thread(target=scheduled_scan, daemon=True).start()
-    return jsonify({"ok": True, "message": "Scan triggered"})
+    return jsonify({"ok": True, "message": "Scan triggered", "scan": dict(scan_state)})
 
 
 @app.route("/test-telegram", methods=["POST"])
@@ -997,14 +1041,22 @@ def trigger_backtest():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """
-    Receives JSON alerts from ZSCN Ultimate v4 via TradingView webhook.
-    Pine alert() fires on stage transitions (2=BOS, 4=Confluence, 5=TradeReady, 6=Invalidated).
-    Harry creates ONE alert per pair in TradingView: condition = 'Any alert() call'.
+    Receives JSON alerts from the ZSCN Strategy Engine.
+    Current stages: 5=in zone, 6=trade ready, 7=invalidated.
+    Create one TradingView alert per pair with condition "Any alert() function call".
     """
     try:
-        data = request.get_json(force=True)
+        expected_secret = os.environ.get("TRADINGVIEW_WEBHOOK_SECRET", "")
+        provided_secret = request.args.get("secret", "") or request.headers.get("X-Trade-Secret", "")
+        if expected_secret and provided_secret != expected_secret:
+            return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+        data = request.get_json(silent=True)
         if not data:
-            return jsonify({"ok": False, "error": "No JSON body"}), 400
+            return jsonify({
+                "ok": False,
+                "error": "Expected a JSON body from Pine alert(), not an alertcondition text message",
+            }), 400
 
         raw_pair  = str(data.get("pair", "UNKNOWN"))
         pair      = raw_pair.upper().replace("OANDA:", "").replace("FX:", "").replace("FOREXCOM:", "")
@@ -1014,7 +1066,9 @@ def webhook():
 
         logger.info(f"Webhook: {pair} stage={stage} {direction} @ {price}")
 
-        if stage == 2:
+        event = str(data.get("event", "")).lower()
+
+        if event == "bos":
             fib_50  = float(data.get("fib_50",  0) or 0) or None
             fib_618 = float(data.get("fib_618", 0) or 0) or None
             send_bos_alert({
@@ -1027,7 +1081,7 @@ def webhook():
                 "fib_sr_overlap": False,
             })
 
-        elif stage == 4:
+        elif stage in (4, 5):
             fib_50  = float(data.get("fib_50",  0) or 0) or None
             fib_618 = float(data.get("fib_618", 0) or 0) or None
             in_fib  = bool(data.get("in_fib", False))
@@ -1046,7 +1100,7 @@ def webhook():
                 "fib_sr_overlap": False,
             })
 
-        elif stage == 5:
+        elif stage == 6:
             sl      = float(data.get("sl",      0) or 0) or None
             tp      = float(data.get("tp",      0) or 0) or None
             fib_50  = float(data.get("fib_50",  0) or 0) or None
@@ -1076,15 +1130,15 @@ def webhook():
                 "fib_sr_overlap": False,
             })
 
-        elif stage == 6:
+        elif stage == 7:
             trade = active_webhook_setups.pop(pair, None)
             status = {"pair": pair, "direction": direction, "price": price}
             if trade:
                 send_invalidation_alert(trade, status,
-                    "ZSCN v4 stage 6 — trend flipped or BOS reversed. Do not enter.")
+                    "ZSCN stage 7 — Daily and 4H bias are no longer aligned. Do not enter.")
             else:
                 _tg_post(
-                    f"⚠️ <b>{pair}</b> — Setup invalidated (Stage 6).\n"
+                    f"⚠️ <b>{pair}</b> — Setup invalidated (Stage 7).\n"
                     f"Was not in active tracking (may have been cleared already)."
                 )
 
@@ -1097,7 +1151,7 @@ def webhook():
 
 @app.route("/api/setups")
 def api_setups():
-    """Active Stage-5 setups registered via ZSCN v4 webhook."""
+    """Active Stage-6 trade-ready setups registered by TradingView."""
     return jsonify(list(active_webhook_setups.values()))
 
 
