@@ -49,7 +49,15 @@ def _yf_download(symbol: str, period: str, interval: str,
                              progress=False, auto_adjust=True)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-            return df
+            if not df.empty:
+                return df
+            if attempt < retries - 1:
+                wait = (attempt + 1) * 2 + random.uniform(0, 1)
+                logger.warning(
+                    f"[{symbol}] Empty {interval} response "
+                    f"(attempt {attempt+1}/{retries}) — retrying in {wait:.1f}s"
+                )
+                time.sleep(wait)
         except Exception as e:
             msg = str(e).lower()
             if "rate" in msg or "too many" in msg or "429" in msg:
@@ -61,7 +69,7 @@ def _yf_download(symbol: str, period: str, interval: str,
                 time.sleep(wait)
             else:
                 raise
-    logger.warning(f"[{symbol}] All {retries} download attempts failed — returning empty")
+    logger.warning(f"[{symbol}] All {retries} download attempts failed or were empty")
     return pd.DataFrame()
 
 
