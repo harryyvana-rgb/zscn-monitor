@@ -98,6 +98,26 @@ class LiveStatusTests(unittest.TestCase):
         self.assertEqual(plan["strategy_grade"], "A")
         self.assertIn("Daily and 4H structure agreement", plan["missing_reasons"])
 
+    def test_15m_fetch_waits_for_real_setup_location(self):
+        base = {
+            "direction": "LONG",
+            "trends_agree": True,
+            "all_trends_agree": False,
+            "at_sr": False,
+            "in_golden_zone": False,
+            "fib_sr_overlap": False,
+            "ema_stack_high_conviction": False,
+            "is_retest": False,
+        }
+
+        self.assertFalse(monitor._should_fetch_15m_signal(base))
+
+        near_stack = dict(base, ema_stack_high_conviction=True)
+        self.assertTrue(monitor._should_fetch_15m_signal(near_stack))
+
+        bad_structure = dict(near_stack, trends_agree=False, all_trends_agree=False)
+        self.assertFalse(monitor._should_fetch_15m_signal(bad_structure))
+
     @patch.object(monitor, "_save_pair_status_to_disk")
     def test_tradingview_event_updates_dashboard_immediately(self, save_status):
         original = dict(monitor.pair_status)

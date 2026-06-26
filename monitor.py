@@ -42,7 +42,7 @@ def _yf_download(symbol: str, period: str, interval: str,
     Also adds a small random jitter before the first request so concurrent
     threads don't all hit Yahoo Finance at the exact same millisecond.
     """
-    time.sleep(random.uniform(0.3, 1.5))   # jitter: spread out initial requests
+    time.sleep(random.uniform(0.8, 2.5))   # jitter: spread out initial requests
     for attempt in range(retries):
         try:
             df = yf.download(symbol, period=period, interval=interval,
@@ -61,7 +61,7 @@ def _yf_download(symbol: str, period: str, interval: str,
         except Exception as e:
             msg = str(e).lower()
             if "rate" in msg or "too many" in msg or "429" in msg:
-                wait = (2 ** attempt) * 5 + random.uniform(0, 3)
+                wait = (2 ** attempt) * 20 + random.uniform(5, 15)
                 logger.warning(
                     f"[{symbol}] Rate limited (attempt {attempt+1}/{retries}) "
                     f"— retrying in {wait:.1f}s"
@@ -607,7 +607,7 @@ MARKET_KIND_BY_PAIR = {
     "VIX": "US_MARKET",
     "TSLA": "US_MARKET",
 }
-SCAN_INTERVAL_MINUTES = 5
+SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_INTERVAL_MINUTES", "15"))
 ALERT_COOLDOWN_HOURS  = 4
 SR_PROXIMITY_PCT      = 0.30   # within 0.30% = "at the zone"
 SR_CLUSTER_PCT        = 0.20   # merge levels within 0.20% of each other
@@ -813,6 +813,25 @@ def _derive_trade_plan(status: dict) -> dict:
         "setup_reasons": reasons[:6],
         "missing_reasons": missing[:5],
     }
+
+
+def _should_fetch_15m_signal(status: dict) -> bool:
+    """
+    Pull 15M data only when the higher-timeframe story is close enough to matter.
+    TradingView/MCP remains the live entry-confirmation path, and this prevents
+    Yahoo rate limits from starving the full dashboard.
+    """
+    if status.get("direction") == "NONE":
+        return False
+    if not (status.get("trends_agree") or status.get("all_trends_agree")):
+        return False
+    return any([
+        status.get("at_sr"),
+        status.get("in_golden_zone"),
+        status.get("fib_sr_overlap"),
+        status.get("ema_stack_high_conviction"),
+        status.get("is_retest"),
+    ])
 
 
 def _market_state(now: datetime | None = None, market_kind: str = "FOREX") -> str:
@@ -1476,7 +1495,6 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         ohlc   = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
         df_4h  = df_1h.resample("4h").agg(ohlc).dropna()
         df_2h  = df_1h.resample("2h").agg(ohlc).dropna()
-        df_15m = _yf_download(yf_symbol, period="5d", interval="15m")
 
         if len(df_4h) < 55 or len(df_2h) < 55:
             status["error"] = "Not enough resampled bars"
@@ -1617,6 +1635,11 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         status.update(br)
 
         # ── 15M signal candle ────────────────────────────────────────────────
+        if _should_fetch_15m_signal(status):
+            df_15m = _yf_download(yf_symbol, period="5d", interval="15m")
+        else:
+            df_15m = pd.DataFrame()
+
         if len(df_15m) >= 3:
             sig, sig_quality = _signal_candle(df_15m, direction)
             status["signal_15m"]    = sig
