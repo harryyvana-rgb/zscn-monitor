@@ -35,6 +35,8 @@
     .pair-card.alert-long { border-color: #3fb950; }
     .pair-card.alert-short { border-color: #f85149; }
     .pair-card.ema-aligned { border-color: #388bfd; }
+    .pair-card.high-conviction { border-color: #d29922; box-shadow: 0 0 0 1px rgba(210,153,34,.25); }
+    .pair-card.trade-ready { border-color: #3fb950; box-shadow: 0 0 0 1px rgba(63,185,80,.25); }
     .pair-card.stale { border-style: dashed; opacity: .78; }
     .pair-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
     .pair-name { font-size: 14px; font-weight: 700; color: #fff; }
@@ -50,6 +52,15 @@
     .badge-none { background: #21262d; color: #8b949e; }
     .badge-score { background: rgba(210,153,34,.15); color: #e3b341; }
     .badge-stale { background: rgba(210,153,34,.15); color: #e3b341; }
+    .badge-stage { background: rgba(88,166,255,.15); color: #79c0ff; }
+    .badge-stack { background: rgba(210,153,34,.15); color: #e3b341; }
+    .badge-ready { background: rgba(63,185,80,.15); color: #3fb950; }
+    .strategy-box {
+      margin-top: 9px; padding: 8px; border-radius: 6px;
+      background: rgba(13,17,23,.65); border: 1px solid #21262d;
+    }
+    .strategy-action { font-size: 11px; font-weight: 700; color: #e6edf3; line-height: 1.35; }
+    .strategy-detail { color: #8b949e; font-size: 10px; margin-top: 5px; line-height: 1.45; }
     .ema-dots { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; margin-top: 8px; }
     .ema-dot {
       text-align: center; font-size: 10px; padding: 4px 2px; border-radius: 4px;
@@ -97,7 +108,11 @@
       {% for p in pairs %}
         {% set dir = p.get('direction', 'NONE') %}
         {% set stale = p.get('stale', false) %}
-        {% if p.get('alert') and dir == 'LONG' %}
+        {% if p.get('strategy_stage') == 6 %}
+          {% set card_class = 'trade-ready' %}
+        {% elif p.get('ema_stack_high_conviction') %}
+          {% set card_class = 'high-conviction' %}
+        {% elif p.get('alert') and dir == 'LONG' %}
           {% set card_class = 'alert-long' %}
         {% elif p.get('alert') and dir == 'SHORT' %}
           {% set card_class = 'alert-short' %}
@@ -121,6 +136,14 @@
             <span class="badge badge-none">Mixed timeframes</span>
           {% endif %}
           <span class="badge badge-score">{{ p.get('confluence_score', 0) }}/4</span>
+          <span class="badge badge-stage">S{{ p.get('strategy_stage', 0) }} {{ p.get('strategy_stage_label', 'No Story') }}</span>
+          <span class="badge badge-score">{{ p.get('strategy_score', 0) }}/17 {{ p.get('strategy_grade', 'STAY AWAY') }}</span>
+          {% if p.get('ema_stack_high_conviction') %}
+            <span class="badge badge-stack">4H/2H EMA STACK</span>
+          {% endif %}
+          {% if p.get('strategy_stage') == 6 %}
+            <span class="badge badge-ready">TRADE READY</span>
+          {% endif %}
           {% if stale %}
             <span class="badge badge-stale">STALE</span>
           {% elif p.get('market_state') == 'CLOSED' %}
@@ -137,6 +160,27 @@
           <div class="tf-detail">
             4H EMA slope: {{ p.get('ema_4h_slope', '-') }} |
             2H EMA slope: {{ p.get('ema_2h_slope', '-') }}
+          </div>
+          <div class="strategy-box">
+            <div class="strategy-action">{{ p.get('strategy_action', 'Stay away until the timeframes align') }}</div>
+            <div class="strategy-detail">
+              EMA stack:
+              {% if p.get('ema_stack_level') %}
+                {{ p.get('ema_stack_level') }}
+                {% if p.get('ema_stack_distance_pct') is not none %}({{ p.get('ema_stack_distance_pct') }}% apart){% endif %}
+                {% if p.get('ema_stack_price_distance_pct') is not none %}| price {{ p.get('ema_stack_price_distance_pct') }}% away{% endif %}
+              {% else %}
+                not formed
+              {% endif %}
+            </div>
+            <div class="strategy-detail">
+              Missing:
+              {% if p.get('missing_reasons') %}
+                {{ p.get('missing_reasons')[0] }}
+              {% else %}
+                none
+              {% endif %}
+            </div>
           </div>
           <div class="pair-meta">
             {{ p.get('source_status', p.get('source', 'Scanner')) }}

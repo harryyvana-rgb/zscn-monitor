@@ -49,12 +49,54 @@ class LiveStatusTests(unittest.TestCase):
         self.assertEqual(len(monitor.PAIRS), 34)
         self.assertEqual(
             monitor.RED_PAIRS,
-            {"EURAUD", "EURNZD", "NZDCHF"},
+            {"GBPAUD", "GBPUSD", "EURAUD"},
         )
         self.assertTrue(
-            {"NZDCAD", "BTCUSD", "LTCUSDT", "US30USD", "VIX", "TSLA"}
+            {"NZDCAD", "BTCUSD", "LTCUSDT", "US30USD", "VIX", "TSLA", "EURNZD", "NZDCHF"}
             .issubset(monitor.PAIRS)
         )
+
+    def test_ema_stack_marks_high_conviction_reaction_level(self):
+        stack = monitor._ema_stack_reaction(
+            price=1.204,
+            ema_4h=1.2,
+            ema_2h=1.201,
+            tf_4h="BULLISH",
+            tf_2h="BULLISH",
+            ema_4h_slope="UP",
+            ema_2h_slope="UP",
+        )
+
+        self.assertTrue(stack["ema_stack_aligned"])
+        self.assertTrue(stack["ema_stack_high_conviction"])
+        self.assertEqual(stack["ema_stack_side"], "BULLISH")
+        self.assertEqual(stack["ema_stack_level"], 1.2005)
+
+    def test_trade_plan_keeps_structure_as_king(self):
+        status = {
+            "direction": "SHORT",
+            "ema_aligned": True,
+            "daily_trend": "RANGING",
+            "h4_trend": "BEARISH",
+            "trends_agree": False,
+            "bos_detected": True,
+            "ema_stack_aligned": True,
+            "ema_stack_high_conviction": True,
+            "ema_stack_level": 1.2,
+            "ema_stack_distance_pct": 0.05,
+            "in_golden_zone": True,
+            "fib_sr_overlap": True,
+            "at_sr": True,
+            "has_signal": True,
+            "signal_15m": "Engulfing (Bearish)",
+            "pullback_valid": True,
+        }
+
+        plan = monitor._derive_trade_plan(status)
+
+        self.assertEqual(plan["strategy_stage"], 1)
+        self.assertEqual(plan["strategy_grade"], "A")
+        self.assertIn("Daily and 4H structure agreement", plan["missing_reasons"])
 
     @patch.object(monitor, "_save_pair_status_to_disk")
     def test_tradingview_event_updates_dashboard_immediately(self, save_status):

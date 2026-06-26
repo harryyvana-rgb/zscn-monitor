@@ -594,7 +594,7 @@ PAIRS = {
     "US30USD": "^DJI", "VIX": "^VIX", "TSLA": "TSLA",
 }
 
-RED_PAIRS = {"EURAUD", "EURNZD", "NZDCHF"}
+RED_PAIRS = {"GBPAUD", "GBPUSD", "EURAUD"}
 WATCHLIST_BY_PAIR = {
     pair: ("Red" if pair in RED_PAIRS else "Cyan")
     for pair in PAIRS
@@ -613,6 +613,8 @@ SR_PROXIMITY_PCT      = 0.30   # within 0.30% = "at the zone"
 SR_CLUSTER_PCT        = 0.20   # merge levels within 0.20% of each other
 TRENDLINE_PROXIMITY   = 0.25   # within 0.25% of trend line = bonus confluence
 SL_BUFFER_PCT         = 0.10   # SL placed 0.10% beyond the S/R level
+EMA_STACK_PROXIMITY_PCT = 0.18 # 4H/2H EMAs within this % = stacked reaction level
+EMA_STACK_APPROACH_PCT  = 0.45 # price within this % of stacked EMAs = approaching zone
 
 pair_status          = _load_pair_status_from_disk()
 recent_alerts        = _load_alerts_from_disk()
@@ -638,6 +640,179 @@ def _ema_side(price: float, ema_value: float) -> str:
     if price < ema_value:
         return "BEARISH"
     return "FLAT"
+
+
+def _pct_distance(a: float | None, b: float | None) -> float | None:
+    if not a or not b:
+        return None
+    base = abs(b)
+    if base == 0:
+        return None
+    return round(abs(a - b) / base * 100, 3)
+
+
+def _ema_stack_reaction(price: float, ema_4h: float, ema_2h: float,
+                        tf_4h: str, tf_2h: str,
+                        ema_4h_slope: str, ema_2h_slope: str) -> dict:
+    """
+    Harry rule: market structure is king, but when 4H and 2H 50 EMAs
+    align around the same level, that level is a high-conviction reaction zone.
+    """
+    level = round((ema_4h + ema_2h) / 2, 5)
+    stack_distance_pct = _pct_distance(ema_4h, ema_2h)
+    price_distance_pct = _pct_distance(price, level)
+    same_side = tf_4h == tf_2h and tf_4h in ("BULLISH", "BEARISH")
+    same_slope = (
+        (ema_4h_slope == "UP" and ema_2h_slope == "UP") or
+        (ema_4h_slope == "DOWN" and ema_2h_slope == "DOWN")
+    )
+    stacked = (
+        stack_distance_pct is not None
+        and stack_distance_pct <= EMA_STACK_PROXIMITY_PCT
+        and same_side
+    )
+    approaching = (
+        stacked
+        and price_distance_pct is not None
+        and price_distance_pct <= EMA_STACK_APPROACH_PCT
+    )
+    return {
+        "ema_stack_aligned": stacked,
+        "ema_stack_high_conviction": stacked and approaching,
+        "ema_stack_level": level,
+        "ema_stack_distance_pct": stack_distance_pct,
+        "ema_stack_price_distance_pct": price_distance_pct,
+        "ema_stack_side": tf_4h if same_side else "MIXED",
+        "ema_stack_slope_aligned": same_slope,
+    }
+
+
+def _derive_trade_plan(status: dict) -> dict:
+    """
+    Converts the raw scanner fields into the trade-command-center language:
+    stage, action, quality score, why it is ready, and why it is not ready.
+    """
+    direction = status.get("direction", "NONE")
+    reasons = []
+    missing = []
+
+    structure_clear = status.get("daily_trend") in ("BULLISH", "BEARISH")
+    structure_agrees = bool(status.get("trends_agree"))
+    bos = bool(status.get("bos_detected"))
+    ema_stack = bool(status.get("ema_stack_aligned"))
+    ema_reaction = bool(status.get("ema_stack_high_conviction"))
+    in_golden = bool(status.get("in_golden_zone"))
+    fib_sr = bool(status.get("fib_sr_overlap"))
+    at_sr = bool(status.get("at_sr"))
+    has_signal = bool(status.get("has_signal"))
+    pullback_valid = status.get("pullback_valid", True)
+
+    score = 0
+    if direction != "NONE" and status.get("ema_aligned"):
+        score += 1
+        reasons.append("D/4H/2H/1H EMA direction is aligned")
+    else:
+        missing.append("4-timeframe EMA alignment")
+
+    if structure_clear:
+        score += 2
+        reasons.append(f"Daily structure is {status.get('daily_trend')}")
+    else:
+        missing.append("clean Daily market structure")
+
+    if structure_agrees:
+        score += 2
+        reasons.append(f"Daily and 4H structure agree for {direction}")
+    else:
+        missing.append("Daily and 4H structure agreement")
+
+    if bos:
+        score += 2
+        reasons.append("4H BOS is confirmed")
+    else:
+        missing.append("4H BOS")
+
+    if ema_stack:
+        score += 2
+        level = status.get("ema_stack_level")
+        dist = status.get("ema_stack_distance_pct")
+        reasons.append(f"4H/2H EMA stack at {level} ({dist}% apart)")
+    else:
+        missing.append("4H/2H EMA stack")
+
+    if ema_reaction:
+        score += 1
+        reasons.append("price is close enough to the 4H/2H EMA reaction level")
+
+    if in_golden:
+        score += 2
+        reasons.append("price is inside the 50-61.8 fib zone")
+    else:
+        missing.append("50-61.8 fib zone touch")
+
+    if fib_sr:
+        score += 2
+        reasons.append("fib zone overlaps 4H S/R")
+    elif at_sr:
+        score += 1
+        reasons.append("price is at a 4H S/R zone")
+    else:
+        missing.append("S/R confluence")
+
+    if has_signal:
+        score += 3
+        reasons.append(f"15M confirmation: {status.get('signal_15m')}")
+    else:
+        missing.append("closed 15M confirmation candle")
+
+    if not pullback_valid:
+        return {
+            "strategy_stage": 7,
+            "strategy_stage_label": "Invalidated",
+            "strategy_action": "Cancel the setup",
+            "strategy_score": score,
+            "strategy_grade": "INVALID",
+            "setup_reasons": reasons,
+            "missing_reasons": ["pullback is no longer valid"] + missing[:4],
+        }
+
+    if direction == "NONE":
+        stage, label, action = 0, "No Story", "Stay away until the timeframes align"
+    elif not structure_agrees:
+        stage, label, action = 1, "Bias Forming", "Watch only - structure is not clean yet"
+    elif structure_agrees and not bos:
+        stage, label, action = 1, "Bias Forming", "Wait for 4H BOS"
+    elif bos and not (ema_reaction or in_golden or at_sr):
+        stage, label, action = 2, "4H BOS Confirmed", "Draw fib and wait for pullback"
+    elif ema_reaction and not (in_golden or at_sr):
+        stage, label, action = 3, "Pullback To EMA Stack", "Watch the reaction level"
+    elif (in_golden or at_sr or fib_sr) and not has_signal:
+        stage, label, action = 5, "Waiting For 15M Confirmation", "Wait for closed 15M confirmation"
+    elif has_signal and score >= 12:
+        stage, label, action = 6, "Trade Ready", "Verify chart, SL and TP before entry"
+    else:
+        stage, label, action = 4, "In Confluence Zone", "Be patient - one piece is still missing"
+
+    if stage == 6 and score >= 14:
+        grade = "A+"
+    elif score >= 12:
+        grade = "A"
+    elif score >= 8:
+        grade = "B"
+    elif score >= 5:
+        grade = "WATCH"
+    else:
+        grade = "STAY AWAY"
+
+    return {
+        "strategy_stage": stage,
+        "strategy_stage_label": label,
+        "strategy_action": action,
+        "strategy_score": score,
+        "strategy_grade": grade,
+        "setup_reasons": reasons[:6],
+        "missing_reasons": missing[:5],
+    }
 
 
 def _market_state(now: datetime | None = None, market_kind: str = "FOREX") -> str:
@@ -1255,6 +1430,10 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         "tf_2h": "UNKNOWN", "tf_1h": "UNKNOWN",
         "ema_d": None, "ema_4h": None, "ema_2h": None, "ema_1h": None,
         "ema_4h_slope": "UNKNOWN", "ema_2h_slope": "UNKNOWN",
+        "ema_stack_aligned": False, "ema_stack_high_conviction": False,
+        "ema_stack_level": None, "ema_stack_distance_pct": None,
+        "ema_stack_price_distance_pct": None, "ema_stack_side": "MIXED",
+        "ema_stack_slope_aligned": False,
         "daily_trend": "RANGING", "h4_trend": "RANGING",
         "trends_agree": False,
         "nearest_sr": None, "sr_dist_pct": None, "at_sr": False,
@@ -1270,6 +1449,10 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         "is_retest": False, "retest_level": None, "retest_type": None,
         "signal_15m": "None", "signal_quality": "None", "has_signal": False,
         "confluence_score": 0, "confluence_detail": [],
+        "strategy_stage": 0, "strategy_stage_label": "No Story",
+        "strategy_action": "Stay away until the timeframes align",
+        "strategy_score": 0, "strategy_grade": "STAY AWAY",
+        "setup_reasons": [], "missing_reasons": [],
         "sl": None, "tp": None, "alert_grade": "—",
         "alert": False, "early_warning": False,
         "last_checked": checked_at.strftime("%H:%M UTC"),
@@ -1340,6 +1523,11 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         status["tf_1h"]       = _ema_side(price, ema_1h_val)
         status["ema_4h_slope"] = "UP" if ema_4h_rising else "DOWN"
         status["ema_2h_slope"] = "UP" if ema_2h_rising else "DOWN"
+        status.update(_ema_stack_reaction(
+            price, ema_4h_val, ema_2h_val,
+            status["tf_4h"], status["tf_2h"],
+            status["ema_4h_slope"], status["ema_2h_slope"],
+        ))
         status["data_as_of"], status["data_age_minutes"] = _data_timestamp(df_1h.index[-1])
         status["stale"] = (
             status["market_state"] == "OPEN"
@@ -1350,6 +1538,7 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         status["direction"]   = "LONG" if bull_ema else ("SHORT" if bear_ema else "NONE")
 
         if status["direction"] == "NONE":
+            status.update(_derive_trade_plan(status))
             return status
 
         direction = status["direction"]
@@ -1440,7 +1629,7 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
 
         # 1. EMA (4 TFs aligned)
         score += 1
-        side  = "below" if direction == "LONG" else "above"
+        side  = "above" if direction == "LONG" else "below"
         curve = "curving up" if direction == "LONG" else "curving down"
         detail.append(f"EMA 50: Daily {side}, 4H {side}+{curve}, 2H {side}+{curve}, 1H {side}")
 
@@ -1538,6 +1727,7 @@ def _check_pair(name: str, yf_symbol: str) -> dict:
         sl, tp = _calc_sl_tp(price, direction, above, below, df_4h, retest_lvl)
         status["sl"] = sl
         status["tp"] = tp
+        status.update(_derive_trade_plan(status))
 
     except Exception as exc:
         logger.exception(f"[{name}] Error: {exc}")
@@ -1771,7 +1961,12 @@ def run_scan(send_telegram_fn, send_early_warning_fn=None, send_bos_alert_fn=Non
 
 def record_live_event(pair: str, data: dict) -> dict:
     """Merge a TradingView webhook event into the latest dashboard status."""
-    normalized = pair.upper()
+    normalized = (
+        pair.upper()
+        .replace("OANDA:", "")
+        .replace("FX:", "")
+        .replace("FOREXCOM:", "")
+    )
     now = datetime.now(timezone.utc)
     with _lock:
         status = dict(pair_status.get(normalized, {
@@ -1798,6 +1993,48 @@ def record_live_event(pair: str, data: dict) -> dict:
         for key in ("tf_d", "tf_4h", "tf_2h", "tf_1h"):
             if data.get(key):
                 status[key] = str(data[key]).upper()
+        for key in (
+            "daily_trend", "h4_trend", "h2_trend",
+            "signal_15m", "signal_quality", "strategy_stage_label",
+            "strategy_action", "strategy_grade", "ema_stack_side",
+            "pullback_depth",
+        ):
+            if data.get(key) is not None:
+                status[key] = str(data[key]).upper() if key.endswith("_trend") else data[key]
+        for key in (
+            "ema_d", "ema_4h", "ema_2h", "ema_1h",
+            "ema_stack_level", "ema_stack_distance_pct",
+            "ema_stack_price_distance_pct", "nearest_sr", "sr_dist_pct",
+            "fib_50", "fib_618", "fib_786", "sl", "tp",
+            "strategy_score",
+        ):
+            if data.get(key) is not None:
+                try:
+                    status[key] = round(float(data[key]), 5)
+                except (TypeError, ValueError):
+                    status[key] = data[key]
+        for key in (
+            "ema_stack_aligned", "ema_stack_high_conviction",
+            "trends_agree", "bos_detected", "in_golden_zone",
+            "fib_sr_overlap", "has_signal", "pullback_valid",
+        ):
+            if data.get(key) is not None:
+                status[key] = bool(data[key])
+        if data.get("stage") is not None:
+            stage = int(data.get("stage", 0) or 0)
+            labels = {
+                0: "No Story",
+                1: "Bias Forming",
+                2: "4H BOS Confirmed",
+                3: "Pullback To EMA Stack",
+                4: "In Confluence Zone",
+                5: "Waiting For 15M Confirmation",
+                6: "Trade Ready",
+                7: "Invalidated",
+            }
+            status["strategy_stage"] = stage
+            if data.get("strategy_stage_label") is None:
+                status["strategy_stage_label"] = labels.get(stage, "Live Event")
         pair_status[normalized] = status
         _save_pair_status_to_disk(pair_status)
         return dict(status)
