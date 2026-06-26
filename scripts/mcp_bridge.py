@@ -4,6 +4,8 @@ import argparse
 import json
 import os
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +18,20 @@ EMA_STACK_PROXIMITY_PCT = 0.18
 EMA_STACK_APPROACH_PCT = 0.45
 BRIDGE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EVENT_LOG = BRIDGE_ROOT / "data" / "mcp_bridge_events.jsonl"
+DEFAULT_TRADE_HYBRID_EVENTS = Path(
+    os.environ.get(
+        "TRADE_HYBRID_EVENTS_FILE",
+        r"C:\Users\harry\Documents\Codex\2026-06-13\i-want-you-to-look-at\work\trade_hybrid\tradingview-events.jsonl",
+    )
+)
+WATCHER_STATUS: dict[str, Any] = {
+    "enabled": False,
+    "file": str(DEFAULT_TRADE_HYBRID_EVENTS),
+    "last_checked_at": None,
+    "last_forwarded_at": None,
+    "forwarded_count": 0,
+    "error": None,
+}
 
 
 def _as_float(value: Any) -> float | None:
@@ -282,6 +298,59 @@ def read_event_log(limit: int = 20) -> list[dict[str, Any]]:
         return []
 
 
+def _line_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as f:
+        return sum(1 for _ in f)
+
+
+def forward_trade_hybrid_record(record: dict[str, Any]) -> dict[str, Any]:
+    raw_payload = record.get("payload") if isinstance(record.get("payload"), dict) else record
+    payload = normalize_event(raw_payload)
+    result = post_json(render_url(), payload, render_secret())
+    append_event_log(payload, result)
+    return {"payload": payload, "result": result}
+
+
+def watch_trade_hybrid_events(path: Path, interval_seconds: float, replay_existing: bool = False) -> None:
+    WATCHER_STATUS.update({
+        "enabled": True,
+        "file": str(path),
+        "error": None,
+    })
+    seen_lines = 0 if replay_existing else _line_count(path)
+    while True:
+        WATCHER_STATUS["last_checked_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            if path.exists():
+                lines = path.read_text(encoding="utf-8").splitlines()
+                if len(lines) < seen_lines:
+                    seen_lines = 0
+                for line in lines[seen_lines:]:
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    forward_trade_hybrid_record(record)
+                    WATCHER_STATUS["forwarded_count"] += 1
+                    WATCHER_STATUS["last_forwarded_at"] = datetime.now(timezone.utc).isoformat()
+                seen_lines = len(lines)
+                WATCHER_STATUS["error"] = None
+        except Exception as exc:
+            WATCHER_STATUS["error"] = str(exc)
+        time.sleep(interval_seconds)
+
+
+def start_trade_hybrid_watcher(path: Path, interval_seconds: float, replay_existing: bool = False) -> None:
+    thread = threading.Thread(
+        target=watch_trade_hybrid_events,
+        args=(path, interval_seconds, replay_existing),
+        daemon=True,
+        name="trade-hybrid-event-watcher",
+    )
+    thread.start()
+
+
 def validate_url(url: str) -> str:
     parsed = parse.urlparse(url)
     path = parsed.path.rstrip("/")
@@ -403,6 +472,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "events_received": len(events),
                 "last_event": events[-1] if events else None,
                 "recent": events,
+                "watcher": WATCHER_STATUS,
             })
             return
         if path == "/dashboard":
@@ -439,9 +509,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
 def run_server(args: argparse.Namespace) -> None:
     host = args.host or os.environ.get("ZSCN_BRIDGE_HOST", "127.0.0.1")
     port = args.port or int(os.environ.get("ZSCN_BRIDGE_PORT", "8788"))
+    if args.watch_trade_hybrid:
+        start_trade_hybrid_watcher(
+            Path(args.trade_hybrid_events),
+            args.watch_interval,
+            replay_existing=args.replay_existing,
+        )
     server = ThreadingHTTPServer((host, port), BridgeHandler)
     print(f"ZSCN MCP bridge listening on http://{host}:{port}/event")
     print(f"Forwarding to {render_url()}")
+    if args.watch_trade_hybrid:
+        print(f"Watching MCP events from {args.trade_hybrid_events}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -476,6 +554,10 @@ def build_parser() -> argparse.ArgumentParser:
     serve = sub.add_parser("serve", help="Run a local HTTP bridge for MCP events.")
     serve.add_argument("--host")
     serve.add_argument("--port", type=int)
+    serve.add_argument("--watch-trade-hybrid", action="store_true", help="Forward new events from trade_hybrid's MCP event file.")
+    serve.add_argument("--trade-hybrid-events", default=str(DEFAULT_TRADE_HYBRID_EVENTS))
+    serve.add_argument("--watch-interval", type=float, default=2.0)
+    serve.add_argument("--replay-existing", action="store_true", help="Forward existing event-file rows on startup.")
     serve.set_defaults(func=lambda args: (run_server(args), 0)[1])
 
     send = sub.add_parser("send", help="Normalize and forward one event.")

@@ -5,7 +5,7 @@ The bridge connects local MCP/TradingView analysis on Harry's computer to the li
 Flow:
 
 ```text
-Local MCP / TradingView tool -> http://127.0.0.1:8788/event -> Render /webhook -> dashboard + Telegram
+Local MCP / TradingView event file -> ZSCN bridge -> Render /webhook -> dashboard + Telegram
 ```
 
 Render can receive webhook data, but it cannot directly reach into a private MCP server on this computer. The bridge solves that by accepting local MCP events and pushing them out to Render.
@@ -50,7 +50,13 @@ Expected result includes:
 .\scripts\start_mcp_bridge.ps1
 ```
 
-The local MCP server should POST JSON to:
+By default, the bridge watches the trade-hybrid MCP event file directly:
+
+```text
+C:\Users\harry\Documents\Codex\2026-06-13\i-want-you-to-look-at\work\trade_hybrid\tradingview-events.jsonl
+```
+
+The local MCP server can also POST JSON to:
 
 ```text
 http://127.0.0.1:8788/event

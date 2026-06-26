@@ -70,6 +70,25 @@ class MCPBridgeTests(unittest.TestCase):
         self.assertEqual(events[0]["stage"], 6)
         self.assertTrue(events[0]["ok"])
 
+    @patch.object(mcp_bridge, "append_event_log")
+    @patch.object(mcp_bridge, "post_json", return_value={"status": 200, "body": {"ok": True}})
+    def test_trade_hybrid_record_forwards_inner_payload(self, post_json, append_event_log):
+        forwarded = mcp_bridge.forward_trade_hybrid_record({
+            "received_at": "2026-06-26T00:00:00+00:00",
+            "payload": {
+                "pair": "OANDA:EURAUD",
+                "signal": "TRADE READY",
+                "stage": 5,
+                "direction": "LONG",
+            },
+        })
+
+        sent_payload = post_json.call_args.args[1]
+        self.assertEqual(sent_payload["pair"], "EURAUD")
+        self.assertEqual(sent_payload["stage"], 6)
+        self.assertEqual(forwarded["result"]["status"], 200)
+        append_event_log.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

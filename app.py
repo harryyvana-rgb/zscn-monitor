@@ -34,6 +34,8 @@ app = Flask(__name__)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "")
+DATA_MODE = os.environ.get("ZSCN_DATA_MODE", "mcp").strip().lower()
+MCP_ONLY_MODE = DATA_MODE in {"mcp", "mcp_only", "webhook", "webhook_only"}
 
 
 def _tg_post(msg: str):
@@ -773,6 +775,15 @@ def check_webhook_tp_sl():
 
 def scheduled_scan():
     global last_scan_time
+    if MCP_ONLY_MODE:
+        logger.info("MCP-only mode enabled; skipping Yahoo scanner")
+        scan_state.update({
+            "status": "mcp_only",
+            "started_at": None,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "error": None,
+        })
+        return
     if not scan_lock.acquire(blocking=False):
         logger.info("Scan already running; skipping duplicate request")
         return
@@ -866,23 +877,24 @@ def scheduled_friday_preview():
 # Sunday 22:00 UTC (5:00 PM CDT)  — market open confirmation
 # Friday 20:00 UTC (3:00 PM CDT)  — end-of-week preview for next week
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(
-    scheduled_scan,
-    "interval",
-    minutes=SCAN_INTERVAL_MINUTES,
-    id="continuous_scan",
-    next_run_time=datetime.now(timezone.utc) + timedelta(seconds=10),
-    max_instances=1,
-    coalesce=True,
-)
-scheduler.add_job(check_webhook_tp_sl,       "interval", minutes=15, id="webhook_tp_sl")
-scheduler.add_job(scheduled_market_update,   "cron", hour=6,  minute=0,  id="london_update")
-scheduler.add_job(scheduled_market_update,   "cron", hour=13, minute=0,  id="ny_update")
-scheduler.add_job(scheduled_weekly_bias,     "cron", day_of_week="sun", hour=11, minute=0,  id="weekly_bias")
-scheduler.add_job(scheduled_week_opener,     "cron", day_of_week="sun", hour=22, minute=0,  id="week_opener")
-scheduler.add_job(scheduled_friday_preview,  "cron", day_of_week="fri", hour=20, minute=0,  id="friday_preview")
-scheduler.add_job(scheduled_weekly_summary,  "cron", day_of_week="fri", hour=21, minute=0,  id="weekly_summary")
-scheduler.add_job(scheduled_backtest,        "cron", day=1,   hour=3,  minute=0,  id="monthly_backtest")
+if not MCP_ONLY_MODE:
+    scheduler.add_job(
+        scheduled_scan,
+        "interval",
+        minutes=SCAN_INTERVAL_MINUTES,
+        id="continuous_scan",
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=10),
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(check_webhook_tp_sl,       "interval", minutes=15, id="webhook_tp_sl")
+    scheduler.add_job(scheduled_market_update,   "cron", hour=6,  minute=0,  id="london_update")
+    scheduler.add_job(scheduled_market_update,   "cron", hour=13, minute=0,  id="ny_update")
+    scheduler.add_job(scheduled_weekly_bias,     "cron", day_of_week="sun", hour=11, minute=0,  id="weekly_bias")
+    scheduler.add_job(scheduled_week_opener,     "cron", day_of_week="sun", hour=22, minute=0,  id="week_opener")
+    scheduler.add_job(scheduled_friday_preview,  "cron", day_of_week="fri", hour=20, minute=0,  id="friday_preview")
+    scheduler.add_job(scheduled_weekly_summary,  "cron", day_of_week="fri", hour=21, minute=0,  id="weekly_summary")
+    scheduler.add_job(scheduled_backtest,        "cron", day=1,   hour=3,  minute=0,  id="monthly_backtest")
 if os.environ.get("ZSCN_DISABLE_SCHEDULER") != "1":
     scheduler.start()
     logger.info(
@@ -913,6 +925,8 @@ def health():
         "alerts_fired": len(recent_alerts),
         "last_scan": last_scan_time,
         "scan_interval_minutes": SCAN_INTERVAL_MINUTES,
+        "data_mode": DATA_MODE,
+        "mcp_only": MCP_ONLY_MODE,
         "scan": dict(scan_state),
     })
 
@@ -990,6 +1004,12 @@ def api_alerts_history():
 
 @app.route("/trigger-scan", methods=["POST"])
 def trigger_scan():
+    if MCP_ONLY_MODE:
+        return jsonify({
+            "ok": False,
+            "message": "MCP-only mode is enabled; scanner is disabled and dashboard waits for bridge/webhook events",
+            "scan": dict(scan_state),
+        }), 409
     if scan_lock.locked():
         return jsonify({
             "ok": False,

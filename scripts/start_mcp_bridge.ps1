@@ -7,4 +7,4 @@ if (-not (Test-Path $Python)) {
     $Python = "python"
 }
 
-& $Python (Join-Path $Root "scripts\mcp_bridge.py") serve
+& $Python (Join-Path $Root "scripts\mcp_bridge.py") serve --watch-trade-hybrid
