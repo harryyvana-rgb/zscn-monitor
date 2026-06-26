@@ -288,6 +288,14 @@ def load_event(args: argparse.Namespace) -> dict[str, Any]:
 class BridgeHandler(BaseHTTPRequestHandler):
     server_version = "ZSCNMCPBridge/1.0"
 
+    def _send_html(self, status: int, html: str) -> None:
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, indent=2).encode("utf-8")
         self.send_response(status)
@@ -304,9 +312,53 @@ class BridgeHandler(BaseHTTPRequestHandler):
         provided = self.headers.get("X-Bridge-Token", "") or (query.get("token", [""])[0])
         return provided == token
 
+    def _status_page(self) -> str:
+        dashboard_url = "https://zscn-monitor.onrender.com/dashboard"
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ZSCN MCP Bridge</title>
+  <style>
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0d1117; color: #e6edf3; font-family: Segoe UI, Arial, sans-serif; }}
+    main {{ width: min(720px, calc(100vw - 32px)); background: #161b22; border: 1px solid #30363d; border-radius: 14px; padding: 28px; box-shadow: 0 18px 50px rgba(0,0,0,.28); }}
+    h1 {{ margin: 0 0 8px; font-size: 26px; }}
+    p {{ color: #8b949e; line-height: 1.55; }}
+    code {{ background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 2px 6px; color: #79c0ff; }}
+    .ok {{ display: inline-block; background: rgba(63,185,80,.14); color: #3fb950; border: 1px solid rgba(63,185,80,.35); border-radius: 999px; padding: 4px 10px; font-weight: 700; font-size: 12px; }}
+    .actions {{ display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }}
+    a {{ color: #fff; background: #238636; text-decoration: none; padding: 10px 14px; border-radius: 8px; font-weight: 700; }}
+    a.secondary {{ background: #21262d; color: #e6edf3; border: 1px solid #30363d; }}
+  </style>
+</head>
+<body>
+  <main>
+    <span class="ok">Bridge running</span>
+    <h1>ZSCN MCP Bridge</h1>
+    <p>This local page is not the trading dashboard. It is the intake bridge that receives MCP/TradingView events from your computer and forwards them to Render.</p>
+    <p>MCP should POST live events to: <code>http://127.0.0.1:8788/event</code></p>
+    <p>The real live dashboard is on Render.</p>
+    <div class="actions">
+      <a href="{dashboard_url}">Open ZSCN Dashboard</a>
+      <a class="secondary" href="/health">Bridge Health JSON</a>
+    </div>
+  </main>
+</body>
+</html>"""
+
     def do_GET(self) -> None:
-        if parse.urlparse(self.path).path == "/health":
+        path = parse.urlparse(self.path).path
+        if path == "/health":
             self._send_json(200, {"ok": True, "service": "zscn-mcp-bridge"})
+            return
+        if path == "/dashboard":
+            self.send_response(302)
+            self.send_header("Location", "https://zscn-monitor.onrender.com/dashboard")
+            self.end_headers()
+            return
+        if path in {"/", "/event", "/webhook", "/mcp-event"}:
+            self._send_html(200, self._status_page())
             return
         self._send_json(404, {"ok": False, "error": "not found"})
 

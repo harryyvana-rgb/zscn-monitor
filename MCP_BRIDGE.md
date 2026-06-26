@@ -56,6 +56,18 @@ The local MCP server should POST JSON to:
 http://127.0.0.1:8788/event
 ```
 
+If you open that URL in a browser, it shows a bridge status page. The real dashboard is:
+
+```text
+https://zscn-monitor.onrender.com/dashboard
+```
+
+You can also open this local shortcut, which redirects to Render:
+
+```text
+http://127.0.0.1:8788/dashboard
+```
+
 Example event:
 
 ```json
