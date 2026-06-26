@@ -29,6 +29,25 @@ class WebhookTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 401)
 
+    def test_validate_endpoint_checks_secret_without_recording_event(self):
+        with patch.dict(os.environ, {"TRADINGVIEW_WEBHOOK_SECRET": "test-secret"}):
+            blocked = self.client.post(
+                "/webhook/validate",
+                json={"pair": "OANDA:GBPUSD", "stage": 6, "event": "bridge_test"},
+            )
+            allowed = self.client.post(
+                "/webhook/validate",
+                headers={"X-Trade-Secret": "test-secret"},
+                json={"pair": "OANDA:GBPUSD", "stage": 6, "event": "bridge_test"},
+            )
+
+        self.assertEqual(blocked.status_code, 401)
+        self.assertEqual(allowed.status_code, 200)
+        body = allowed.get_json()
+        self.assertTrue(body["validated_only"])
+        self.assertEqual(body["pair"], "GBPUSD")
+        self.assertEqual(app.active_webhook_setups, {})
+
     @patch.object(app, "send_telegram")
     @patch.object(app, "record_live_event")
     def test_stage_6_registers_trade_ready_setup(self, record_live_event, send_telegram):

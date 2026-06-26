@@ -1047,6 +1047,44 @@ def trigger_backtest():
     return jsonify({"ok": True, "message": "Backtest started — results sent to Telegram in ~3-5 min"})
 
 
+def _webhook_secret_valid() -> bool:
+    expected_secret = os.environ.get("TRADINGVIEW_WEBHOOK_SECRET", "")
+    provided_secret = request.args.get("secret", "") or request.headers.get("X-Trade-Secret", "")
+    return not expected_secret or provided_secret == expected_secret
+
+
+def _normalize_webhook_pair(raw_pair: str) -> str:
+    return (
+        str(raw_pair or "UNKNOWN")
+        .upper()
+        .replace("OANDA:", "")
+        .replace("FX:", "")
+        .replace("FOREXCOM:", "")
+    )
+
+
+@app.route("/webhook/validate", methods=["POST"])
+def webhook_validate():
+    """Validate webhook auth and JSON shape without changing dashboard state."""
+    if not _webhook_secret_valid():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "ok": False,
+            "error": "Expected a JSON body from Pine alert(), not an alertcondition text message",
+        }), 400
+
+    return jsonify({
+        "ok": True,
+        "pair": _normalize_webhook_pair(data.get("pair", "UNKNOWN")),
+        "stage": int(data.get("stage", 0) or 0),
+        "event": str(data.get("event", "") or ""),
+        "validated_only": True,
+    })
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """
@@ -1055,9 +1093,7 @@ def webhook():
     Create one TradingView alert per pair with condition "Any alert() function call".
     """
     try:
-        expected_secret = os.environ.get("TRADINGVIEW_WEBHOOK_SECRET", "")
-        provided_secret = request.args.get("secret", "") or request.headers.get("X-Trade-Secret", "")
-        if expected_secret and provided_secret != expected_secret:
+        if not _webhook_secret_valid():
             return jsonify({"ok": False, "error": "unauthorized"}), 401
 
         data = request.get_json(silent=True)
@@ -1067,8 +1103,7 @@ def webhook():
                 "error": "Expected a JSON body from Pine alert(), not an alertcondition text message",
             }), 400
 
-        raw_pair  = str(data.get("pair", "UNKNOWN"))
-        pair      = raw_pair.upper().replace("OANDA:", "").replace("FX:", "").replace("FOREXCOM:", "")
+        pair      = _normalize_webhook_pair(data.get("pair", "UNKNOWN"))
         direction = str(data.get("direction", ""))
         stage     = int(data.get("stage", 0))
         price     = float(data.get("price", 0) or 0)
