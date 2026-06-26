@@ -5,6 +5,8 @@ import json
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib import error, parse, request
 
@@ -12,6 +14,8 @@ from urllib import error, parse, request
 DEFAULT_RENDER_WEBHOOK = "https://zscn-monitor.onrender.com/webhook"
 EMA_STACK_PROXIMITY_PCT = 0.18
 EMA_STACK_APPROACH_PCT = 0.45
+BRIDGE_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_EVENT_LOG = BRIDGE_ROOT / "data" / "mcp_bridge_events.jsonl"
 
 
 def _as_float(value: Any) -> float | None:
@@ -247,6 +251,37 @@ def render_secret() -> str:
     return os.environ.get("ZSCN_WEBHOOK_SECRET") or os.environ.get("TRADINGVIEW_WEBHOOK_SECRET", "")
 
 
+def event_log_path() -> Path:
+    return Path(os.environ.get("ZSCN_BRIDGE_EVENT_LOG", str(DEFAULT_EVENT_LOG)))
+
+
+def append_event_log(payload: dict[str, Any], result: dict[str, Any]) -> None:
+    path = event_log_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "pair": payload.get("pair"),
+        "stage": payload.get("stage"),
+        "event": payload.get("event"),
+        "direction": payload.get("direction"),
+        "render_status": result.get("status"),
+        "ok": result.get("status", 500) < 400,
+    }
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+def read_event_log(limit: int = 20) -> list[dict[str, Any]]:
+    path = event_log_path()
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-limit:]
+        return [json.loads(line) for line in lines if line.strip()]
+    except Exception:
+        return []
+
+
 def validate_url(url: str) -> str:
     parsed = parse.urlparse(url)
     path = parsed.path.rstrip("/")
@@ -314,6 +349,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def _status_page(self) -> str:
         dashboard_url = "https://zscn-monitor.onrender.com/dashboard"
+        events = read_event_log(limit=1)
+        last_event = events[-1] if events else None
+        last_text = (
+            f"Last MCP post: {last_event.get('pair')} stage {last_event.get('stage')} at {last_event.get('received_at')}"
+            if last_event else
+            "No MCP posts received by this bridge yet."
+        )
         return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -339,9 +381,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
     <p>This local page is not the trading dashboard. It is the intake bridge that receives MCP/TradingView events from your computer and forwards them to Render.</p>
     <p>MCP should POST live events to: <code>http://127.0.0.1:8788/event</code></p>
     <p>The real live dashboard is on Render.</p>
+    <p><strong>{last_text}</strong></p>
     <div class="actions">
       <a href="{dashboard_url}">Open ZSCN Dashboard</a>
       <a class="secondary" href="/health">Bridge Health JSON</a>
+      <a class="secondary" href="/stats">Bridge Activity JSON</a>
     </div>
   </main>
 </body>
@@ -351,6 +395,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
         path = parse.urlparse(self.path).path
         if path == "/health":
             self._send_json(200, {"ok": True, "service": "zscn-mcp-bridge"})
+            return
+        if path == "/stats":
+            events = read_event_log(limit=20)
+            self._send_json(200, {
+                "ok": True,
+                "events_received": len(events),
+                "last_event": events[-1] if events else None,
+                "recent": events,
+            })
             return
         if path == "/dashboard":
             self.send_response(302)
@@ -377,6 +430,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             raw_event = json.loads(raw_body)
             payload = normalize_event(raw_event)
             result = post_json(render_url(), payload, render_secret())
+            append_event_log(payload, result)
             self._send_json(200, {"ok": result["status"] < 400, "forwarded": payload, "render": result})
         except Exception as exc:
             self._send_json(500, {"ok": False, "error": str(exc)})

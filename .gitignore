@@ -8,5 +8,6 @@ venv/
 alerts.json
 data/pair_status.json
 data/pair_status.json.tmp
+data/mcp_bridge_events.jsonl
 *.log
 .DS_Store

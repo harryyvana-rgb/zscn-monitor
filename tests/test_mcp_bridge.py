@@ -1,4 +1,7 @@
 import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 from scripts import mcp_bridge
 
@@ -51,6 +54,21 @@ class MCPBridgeTests(unittest.TestCase):
         })
 
         self.assertEqual(payload["stage"], 7)
+
+    def test_bridge_event_log_records_forwarded_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "events.jsonl"
+            with patch.dict("os.environ", {"ZSCN_BRIDGE_EVENT_LOG": str(log_path)}):
+                mcp_bridge.append_event_log(
+                    {"pair": "GBPUSD", "stage": 6, "event": "trade_ready", "direction": "SHORT"},
+                    {"status": 200},
+                )
+                events = mcp_bridge.read_event_log()
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["pair"], "GBPUSD")
+        self.assertEqual(events[0]["stage"], 6)
+        self.assertTrue(events[0]["ok"])
 
 
 if __name__ == "__main__":
