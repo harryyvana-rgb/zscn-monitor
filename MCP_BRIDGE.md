@@ -5,7 +5,7 @@ The bridge connects local MCP/TradingView analysis on Harry's computer to the li
 Flow:
 
 ```text
-Local MCP / TradingView tool -> http://127.0.0.1:8787/event -> Render /webhook -> dashboard + Telegram
+Local MCP / TradingView tool -> http://127.0.0.1:8788/event -> Render /webhook -> dashboard + Telegram
 ```
 
 Render can receive webhook data, but it cannot directly reach into a private MCP server on this computer. The bridge solves that by accepting local MCP events and pushing them out to Render.
@@ -53,7 +53,7 @@ Expected result includes:
 The local MCP server should POST JSON to:
 
 ```text
-http://127.0.0.1:8787/event
+http://127.0.0.1:8788/event
 ```
 
 Example event:

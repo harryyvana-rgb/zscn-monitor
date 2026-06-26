@@ -332,7 +332,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
 def run_server(args: argparse.Namespace) -> None:
     host = args.host or os.environ.get("ZSCN_BRIDGE_HOST", "127.0.0.1")
-    port = args.port or int(os.environ.get("ZSCN_BRIDGE_PORT", "8787"))
+    port = args.port or int(os.environ.get("ZSCN_BRIDGE_PORT", "8788"))
     server = ThreadingHTTPServer((host, port), BridgeHandler)
     print(f"ZSCN MCP bridge listening on http://{host}:{port}/event")
     print(f"Forwarding to {render_url()}")
